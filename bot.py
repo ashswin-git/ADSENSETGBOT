@@ -30,7 +30,7 @@ BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8759586848:AAG1ttbhtlmUh0yIN5xukEOk
 ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "5866504116"))
 
 # Render free tier: /tmp is writable; repo root is read-only after deploy
-DB_FILE      = os.environ.get("DB_FILE", "/tmp/bot_data.db")
+DB_FILE      = os.environ.get("DB_FILE", os.path.join(os.path.expanduser("~"), "bot_data.db"))
 MAX_ACCOUNTS = 3
 MAX_FAILS    = 5
 
