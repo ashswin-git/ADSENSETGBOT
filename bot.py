@@ -26,7 +26,7 @@ import telethon
 # ─────────────────────────── CONFIG (from ENV) ───────────────
 API_ID    = int(os.environ.get("API_ID",    "35547110"))
 API_HASH  =     os.environ.get("API_HASH",  "47296bf904ea7b45ffc0a71495715ed0")
-BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8779290233:AAH-F0c-e3ggKqFjmS-EsdBP0i3mpaMqTnE")
+BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8759586848:AAG1ttbhtlmUh0yIN5xukEOkeMu-fjfSHY8")
 ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "5866504116"))
 
 # Render free tier: /tmp is writable; repo root is read-only after deploy
