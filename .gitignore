@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Telethon session files (contain secrets — never commit)
+*.session
+*.session-journal
+
+# SQLite DB (data is on Render /tmp, not needed in repo)
+*.db
+*.db-journal
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db

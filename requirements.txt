@@ -1,0 +1,10 @@
+# ─── Telegram Forward Bot — Requirements ───────────────────
+# Install:  pip install -r requirements.txt
+# Termux:   pip install -r requirements.txt --break-system-packages
+# Python:   3.10 or higher required
+
+Telethon==1.42.0
+cryptography>=3.4.8
+pyaes>=1.6.1
+pyaudio>=0.2.11 ; sys_platform != "win32"  # optional, for voice
+rsa>=4.0

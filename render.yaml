@@ -1,0 +1,21 @@
+# render.yaml — Render deployment config
+# Place this file in the ROOT of your GitHub repo
+
+services:
+  - type: worker          # Background Worker — no HTTP needed, no health-check crash
+    name: telegram-forward-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: API_ID
+        sync: false       # you will enter this manually in Render dashboard
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
