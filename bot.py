@@ -24,8 +24,8 @@ from telethon.sessions import StringSession
 import telethon
 
 # ─────────────────────────── CONFIG (from ENV) ───────────────
-API_ID    = int(os.environ.get("API_ID",    "35547110"))
-API_HASH  =     os.environ.get("API_HASH",  "47296bf904ea7b45ffc0a71495715ed0")
+API_ID    = int(os.environ.get("API_ID",    "32301326"))
+API_HASH  =     os.environ.get("API_HASH",  "8d5c01e4c5c697a59839bffdf3a98a10")
 BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8759586848:AAG1ttbhtlmUh0yIN5xukEOkeMu-fjfSHY8")
 ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "7552871562"))
 
@@ -242,32 +242,87 @@ def start_task(tid, uid, phone, sess, interval):
 
 # ─────────────────────────── COMMANDS ────────────────────────
 
+# ── Welcome photo path ──
+import pathlib
+WELCOME_PHOTO = str(pathlib.Path(__file__).parent / "welcome.jpg")
+
+async def send_welcome(event, caption, buttons):
+    """Send photo + caption if image exists, else plain text."""
+    try:
+        if pathlib.Path(WELCOME_PHOTO).exists():
+            await bot.send_file(
+                event.chat_id,
+                WELCOME_PHOTO,
+                caption=caption,
+                buttons=buttons,
+                parse_mode="markdown"
+            )
+        else:
+            await event.reply(caption, buttons=buttons)
+    except Exception:
+        await event.reply(caption, buttons=buttons)
+
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def cmd_start(event):
     uid   = event.sender_id
     uname = getattr(event.sender, "username", "") or ""
     upsert_user(uid, uname)
+
+    # ── ADMIN ──
     if is_admin(uid):
         await event.reply(
             "👑 **Welcome Admin!**\n/help — saari commands",
             buttons=[[Button.text("🔧 Admin Panel")],[Button.text("👤 User Menu")]]
         ); return
+
     ok, tag = await check_access(uid)
+
+    # ── BANNED ──
     if tag == "BANNED":
-        await event.reply("🚫 Aap banned hain."); return
+        await event.reply(
+            "🚫 **Access Denied**\n\nTumhara account ban ho gaya hai.\n"
+            "Admin se contact karo: @V4_XTRD"
+        ); return
+
+    # ── WELCOME CAPTION (har user ke liye same) ──
+    welcome_text = (
+        "🤖 **V4 ADS BOT**\n\n"
+        "✦ _Made by_ **@V4_XTRD**"
+    )
+
+    # ── ALREADY HAS ACCESS ──
     if ok:
-        await event.reply("🎉 **Welcome back!**\n/help — saari commands", buttons=main_kb()); return
+        caption = (
+            welcome_text +
+            "\n\n✅ **Welcome back! Access active hai.**\n"
+            "Menu se kaam shuru karo 👇"
+        )
+        await send_welcome(event, caption, main_kb()); return
+
+    # ── NEW USER — TRIAL ──
     trial = c.execute("SELECT trial_granted FROM users WHERE user_id=?", (uid,)).fetchone()
     if not trial or not trial[0]:
         exp = (now_utc() + timedelta(days=10)).isoformat()
         c.execute("UPDATE users SET trial_granted=1,trial_expires=? WHERE user_id=?", (exp, uid))
         conn.commit()
-        await event.reply(
-            f"👋 **Welcome!** 10 din ka free trial mila!\nValid till: **{exp.split('T')[0]}**\n\n"
-            f"/help — saari commands\n/redeem CODE — code lagao", buttons=main_kb())
+        caption = (
+            welcome_text +
+            f"\n\n🎁 **Welcome! Tumhe 10 din ka FREE Trial mila!**\n"
+            f"⏳ Valid till: **{exp.split('T')[0]}**\n\n"
+            "👇 Start karo!"
+        )
+        await send_welcome(event, caption, main_kb())
+
+    # ── TRIAL EXPIRED ──
     else:
-        await event.reply(
-            "⏳ Trial expire ho gaya.\n/redeem CODE — code lagao", buttons=main_kb())
+        caption = (
+            welcome_text +
+            "\n\n⏳ **Trial expire ho gaya.**\n\n"
+            "🔑 Access ke liye:\n"
+            "   `/redeem CODE` — Code lagao\n"
+            "   📩 Contact: @V4_XTRD"
+        )
+        await send_welcome(event, caption, main_kb())
 
 @bot.on(events.NewMessage(pattern=r"^/help$"))
 async def cmd_help(event):
