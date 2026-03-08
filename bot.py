@@ -27,7 +27,7 @@ import telethon
 API_ID    = int(os.environ.get("API_ID",    "35547110"))
 API_HASH  =     os.environ.get("API_HASH",  "47296bf904ea7b45ffc0a71495715ed0")
 BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8759586848:AAG1ttbhtlmUh0yIN5xukEOkeMu-fjfSHY8")
-ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "5866504116"))
+ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "7552871562"))
 
 # Render free tier: /tmp is writable; repo root is read-only after deploy
 DB_FILE      = os.environ.get("DB_FILE", os.path.join(os.path.expanduser("~"), "bot_data.db"))
@@ -375,7 +375,10 @@ async def cmd_mygroups(event):
             dlgs   = await cl.get_dialogs(limit=None)
             groups = [d for d in dlgs if d.is_group or d.is_channel]
             lines.append(f"\n📱 `{phone}` — **{len(groups)} groups:**")
-            for g in groups: lines.append(f"  {'📣' if g.is_channel else '👥'} {g.name}")
+            for g in groups:
+                    icon  = "📣" if g.is_channel else "👥"
+                    uname = f"@{g.entity.username}" if getattr(g.entity, 'username', None) else "🔒 private"
+                    lines.append(f"  {icon} {g.name}  |  {uname}")
         except Exception as e: lines.append(f"\n⚠️ `{phone}`: {e}")
         finally: await close(cl)
     full = "\n".join(lines)
@@ -700,7 +703,10 @@ async def cmd_usergroups(event):
             dlgs   = await cl.get_dialogs(limit=None)
             groups = [d for d in dlgs if d.is_group or d.is_channel]
             lines.append(f"\n📱 `{phone}` — {len(groups)} groups:")
-            for g in groups: lines.append(f"  {'📣' if g.is_channel else '👥'} {g.name}")
+            for g in groups:
+                icon  = "📣" if g.is_channel else "👥"
+                uname = f"@{g.entity.username}" if getattr(g.entity, 'username', None) else "🔒 private"
+                lines.append(f"  {icon} {g.name}  |  {uname}")
         except Exception as e: lines.append(f"\n⚠️ `{phone}`: {e}")
         finally: await close(cl)
     await msg.edit("\n".join(lines)[:4000])
@@ -950,7 +956,10 @@ async def cb_ugrp(event):
             dlgs = await cl.get_dialogs(limit=None)
             grps = [d for d in dlgs if d.is_group or d.is_channel]
             lines.append(f"\n📱 `{phone}` — {len(grps)}:")
-            for g in grps: lines.append(f"  {'📣' if g.is_channel else '👥'} {g.name}")
+            for g in grps:
+                icon  = "📣" if g.is_channel else "👥"
+                uname = f"@{g.entity.username}" if getattr(g.entity, 'username', None) else "🔒 private"
+                lines.append(f"  {icon} {g.name}  |  {uname}")
         except Exception as e: lines.append(f"\n⚠️ `{phone}`: {e}")
         finally: await close(cl)
     await event.edit("\n".join(lines)[:4000])
