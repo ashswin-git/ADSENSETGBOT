@@ -62,6 +62,22 @@ c.execute("""CREATE TABLE IF NOT EXISTS scheduled_tasks(
     fail_count       INTEGER DEFAULT 0,
     is_active        INTEGER DEFAULT 1,
     created_at       TEXT    DEFAULT CURRENT_TIMESTAMP)""")
+c.execute("""CREATE TABLE IF NOT EXISTS admins(
+    user_id  INTEGER PRIMARY KEY,
+    username TEXT DEFAULT '',
+    added_by INTEGER,
+    added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+c.execute("""CREATE TABLE IF NOT EXISTS code_requests(
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    requested_by INTEGER,
+    days         INTEGER,
+    status       TEXT DEFAULT 'pending',
+    code         TEXT DEFAULT '',
+    requested_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+# Add is_protected column if not exists
+try:
+    c.execute("ALTER TABLE users ADD COLUMN is_protected INTEGER DEFAULT 0")
+except Exception: pass
 conn.commit()
 
 # ─────────────────────────── GLOBALS ─────────────────────────
@@ -71,7 +87,12 @@ scheduler_tasks: dict = {}
 db_lock          = None
 
 # ─────────────────────────── UTILS ───────────────────────────
-def is_admin(uid): return uid == ADMIN_ID
+def is_super_admin(uid):
+    return uid == ADMIN_ID
+
+def is_admin(uid):
+    if uid == ADMIN_ID: return True
+    return c.execute("SELECT user_id FROM admins WHERE user_id=?", (uid,)).fetchone() is not None
 
 async def db_write(sql, params=()):
     async with db_lock:
@@ -137,7 +158,7 @@ async def close(cl):
 # ─────────────────────────── KEYBOARDS ───────────────────────
 def main_kb():
     return [
-        [Button.text("➕ Add Account"),   Button.text("📱 Add Session")],
+        [Button.text("➕ Add Account"),   Button.text("📊 My Groups")],
         [Button.text("⏰ Schedule Msg"),  Button.text("🚀 Send Now")],
         [Button.text("📋 My Schedules"), Button.text("🛑 Stop All")],
         [Button.text("📊 My Groups"),    Button.text("⚙️ Settings")],
@@ -149,7 +170,8 @@ def admin_kb():
         [Button.text("👥 Users"),     Button.text("📱 All Numbers")],
         [Button.text("🔑 Codes"),     Button.text("⏰ All Tasks")],
         [Button.text("➕ Gen Code"),  Button.text("📊 Stats")],
-        [Button.text("📢 Broadcast"), Button.text("🔙 User Menu")],
+        [Button.text("📢 Broadcast"), Button.text("👑 Admins")],
+        [Button.text("🔙 User Menu")],
     ]
 
 def action_btns():
@@ -313,7 +335,6 @@ async def cmd_help(event):
         "/start  /help  /cancel  /myid  /status\n"
         "/redeem CODE\n"
         "/addaccount — Phone se login\n"
-        "/addsession — String session se login ✅\n"
         "/removeaccount +phone\n"
         "/mygroups\n"
         "/sendnow message\n"
@@ -393,25 +414,6 @@ async def cmd_addaccount(event):
         "⚠️ Agar Telegram block kare toh /addsession use karo\n/cancel se wapas."
     )
 
-# ─────────────────────────── /addsession ─────────────────────
-@bot.on(events.NewMessage(pattern=r"^/addsession$"))
-async def cmd_addsession(event):
-    uid     = event.sender_id
-    ok, tag = await check_access(uid)
-    if not ok:
-        await event.reply("❌ Access nahi. /redeem CODE karo."); return
-    cnt = c.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id=?", (uid,)).fetchone()[0]
-    if cnt >= MAX_ACCOUNTS:
-        await event.reply(f"❌ Max {MAX_ACCOUNTS} accounts.\n/removeaccount +phone se pehle hatao."); return
-    pending[uid] = {"action": "add_session_phone"}
-    await event.reply(
-        "📱 **String Session se Account Add Karo**\n\n"
-        "**Step 1:** Pehle Termux mein yeh chalao:\n"
-        "`python generate_session.py`\n\n"
-        "Session generate hone ke baad:\n"
-        "**Step 2:** Phone number bhejo (e.g. `+919876543210`)\n\n"
-        "/cancel se wapas jao."
-    )
 
 # ─────────────────────────── /removeaccount ──────────────────
 @bot.on(events.NewMessage(pattern=r"^/removeaccount\s+(\+\d+)$"))
@@ -544,6 +546,55 @@ async def cmd_settings(event):
     await event.reply("\n".join(lines), buttons=main_kb())
 
 # ─────────────────────────── ADMIN COMMANDS ──────────────────
+@bot.on(events.NewMessage(pattern=r"^/addadmin\s+(\d+)$"))
+async def cmd_addadmin(event):
+    if not is_super_admin(event.sender_id):
+        await event.reply("❌ Sirf Super Admin yeh kar sakta hai."); return
+    uid = int(event.pattern_match.group(1))
+    if uid == ADMIN_ID:
+        await event.reply("⚠️ Yeh already Super Admin hai."); return
+    urow = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    uname = urow[0] if urow and urow[0] else ""
+    await db_write("INSERT OR REPLACE INTO admins(user_id,username,added_by) VALUES(?,?,?)",
+        (uid, uname, event.sender_id))
+    name = f"@{uname}" if uname else f"`{uid}`"
+    name = f"@{uname}" if uname else f"`{uid}`"
+    msg = "✅ " + name + " Admin ban gaya!\n\n🔰 Woh admin panel use kar sakta hai.\n⚠️ Woh naye admin nahi bana sakta.\n\n/removeadmin " + str(uid)
+    await event.reply(msg, buttons=admin_kb())
+
+@bot.on(events.NewMessage(pattern=r"^/removeadmin\s+(\d+)$"))
+async def cmd_removeadmin(event):
+    if not is_super_admin(event.sender_id):
+        await event.reply("❌ Sirf Super Admin yeh kar sakta hai."); return
+    uid = int(event.pattern_match.group(1))
+    row = c.execute("SELECT user_id FROM admins WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        await event.reply(f"❌ `{uid}` admin nahi hai."); return
+    await db_write("DELETE FROM admins WHERE user_id=?", (uid,))
+    await event.reply(f"🗑 `{uid}` admin se remove ho gaya.", buttons=admin_kb())
+
+@bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/admins", "👑 Admins"]))
+async def cmd_admins_list(event):
+    if not is_admin(event.sender_id): return
+    rows = c.execute("SELECT user_id,username,added_at FROM admins").fetchall()
+    out = "👑 **Super Admin (Sirf Tum):**\n"
+    out += "  • `" + str(ADMIN_ID) + "` — Full Powers\n\n"
+    out += "🔰 **Sub Admins** (" + str(len(rows)) + "):\n"
+    if rows:
+        for uid2, uname, added in rows:
+            name = "@" + uname if uname else "`" + str(uid2) + "`"
+            out += "  • " + name + " | `" + str(uid2) + "`\n"
+            if is_super_admin(event.sender_id):
+                out += "    /removeadmin " + str(uid2) + "\n"
+    else:
+        out += "  Koi sub admin nahi\n"
+    if is_super_admin(event.sender_id):
+        out += "\n➕ Add karo: /addadmin USER_ID"
+    await event.reply(out, buttons=admin_kb())
+
+
+
+
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/admin", "🔧 Admin Panel"]))
 async def cmd_admin(event):
     if not is_admin(event.sender_id): return
@@ -579,6 +630,12 @@ async def cmd_users(event):
     lines = ["👥 **Users** (last 20)\n"]
     buttons = []
     for uid2, uname, trial, texp, banned in rows:
+        prot = c.execute("SELECT is_protected FROM users WHERE user_id=?", (uid2,)).fetchone()
+        is_prot = prot[0] if prot else 0
+        if is_prot and not is_super_admin(event.sender_id):
+            lines.append("🔒 Protected User | /userinfo " + str(uid2))
+            buttons.append([Button.inline("🔒 Protected", b"noop")])
+            continue
         ph  = c.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id=?", (uid2,)).fetchone()[0]
         cod = c.execute("SELECT code FROM access_codes WHERE claimed_by=? AND is_active=1", (uid2,)).fetchone()
         st  = "🚫" if banned else ("✅" if cod else "🎁" if (trial and texp and now_utc() <= parse_iso(texp)) else "❌")
@@ -594,11 +651,19 @@ async def cmd_users(event):
 @bot.on(events.NewMessage(pattern=r"^/userinfo\s+(\d+)$"))
 async def cmd_userinfo(event):
     if not is_admin(event.sender_id): return
-    await _show_userinfo(event, int(event.pattern_match.group(1)))
+    await _show_userinfo(event, int(event.pattern_match.group(1)), event.sender_id)
 
-async def _show_userinfo(ctx, uid):
-    row = c.execute("SELECT user_id,username,trial_granted,trial_expires,is_banned,joined_at FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row: await ctx.reply(f"❌ User `{uid}` nahi mila."); return
+async def _show_userinfo(ctx, uid, requester_id=None):
+    row = c.execute("SELECT user_id,username,trial_granted,trial_expires,is_banned,joined_at,is_protected FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row: await ctx.reply("❌ User `" + str(uid) + "` nahi mila."); return
+    # Protection check — sub admin cannot see protected user
+    is_prot = row[6] if len(row) > 6 else 0
+    if is_prot and requester_id and not is_super_admin(requester_id):
+        await ctx.reply(
+            "🔒 **Protected User**\n\n"
+            "Is user ne apna data protect kiya hua hai.\n"
+            "Sirf Owner details dekh sakta hai."
+        ); return
     _, uname, trial, texp, banned, joined = row
     phones = c.execute("SELECT phone,added_at FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
     code   = c.execute("SELECT code,expires_at FROM access_codes WHERE claimed_by=? AND is_active=1", (uid,)).fetchone()
@@ -661,17 +726,83 @@ async def cmd_gencode(event):
         await event.reply("🔑 Kitne din ka code? (e.g. `30`)", buttons=[[Button.text("❌ Cancel")]]); return
     m = re.match(r"^/gencode\s+(\d+)$", text)
     if not m: await event.reply("Usage: /gencode 30"); return
-    await _do_gencode(event, int(m.group(1)))
+    await _do_gencode(event, int(m.group(1)), event.sender_id)
 
-async def _do_gencode(ctx, days):
+async def _do_gencode(ctx, days, requester_id=None):
+    # Super admin — direct generate
+    if requester_id is None or is_super_admin(requester_id):
+        code    = gen_code()
+        expires = (now_utc() + timedelta(days=days)).isoformat()
+        await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at) VALUES(?,?,?,?)",
+            (code, days, now_iso(), expires))
+        await ctx.reply(
+            "✅ **Code Generate Hua!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0] + "\n\n/redeem " + code,
+            buttons=admin_kb()
+        )
+    else:
+        # Sub admin — send approval request to owner
+        req_id = await db_write(
+            "INSERT INTO code_requests(requested_by,days) VALUES(?,?)",
+            (requester_id, days)
+        )
+        urow = c.execute("SELECT username FROM users WHERE user_id=?", (requester_id,)).fetchone()
+        uname = urow[0] if urow and urow[0] else ""
+        name  = "@" + uname if uname else "`" + str(requester_id) + "`"
+        await ctx.reply(
+            "⏳ **Request bheji gayi!**\n\nOwner verify karega tab code milega.",
+            buttons=admin_kb()
+        )
+        # Notify super admin
+        await bot.send_message(
+            ADMIN_ID,
+            "🔔 **Code Request Aayi!**\n\n"
+            "👤 Admin: " + name + "\n"
+            "📅 Days: **" + str(days) + "**\n\n"
+            "Approve karo toh code generate hoga.",
+            buttons=[
+                [Button.inline("✅ Approve", ("creq_ok_" + str(req_id)).encode())],
+                [Button.inline("❌ Reject",  ("creq_no_" + str(req_id)).encode())],
+            ]
+        )
+
+# Approve callback
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"creq_ok_")))
+async def cb_creq_ok(event):
+    if not is_super_admin(event.sender_id): return
+    req_id = int(event.data.decode().replace("creq_ok_", ""))
+    row = c.execute("SELECT requested_by,days,status FROM code_requests WHERE id=?", (req_id,)).fetchone()
+    if not row: await event.edit("❌ Request nahi mili."); return
+    requester, days, status = row
+    if status != "pending": await event.edit("⚠️ Already processed."); return
     code    = gen_code()
     expires = (now_utc() + timedelta(days=days)).isoformat()
     await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at) VALUES(?,?,?,?)",
         (code, days, now_iso(), expires))
-    await ctx.reply(
-        f"✅ **Code Generate Hua!**\n\n🔑 `{code}`\n📅 {days} din\n⏳ {expires.split('T')[0]}\n\n/redeem {code}",
-        buttons=admin_kb()
+    await db_write("UPDATE code_requests SET status=?,code=? WHERE id=?", ("approved", code, req_id))
+    await event.edit(
+        "✅ **Approved!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0]
     )
+    try:
+        await bot.send_message(
+            requester,
+            "✅ **Code Approved By Owner!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0] + "\n\n/redeem " + code
+        )
+    except Exception: pass
+
+# Reject callback
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"creq_no_")))
+async def cb_creq_no(event):
+    if not is_super_admin(event.sender_id): return
+    req_id = int(event.data.decode().replace("creq_no_", ""))
+    row = c.execute("SELECT requested_by,days,status FROM code_requests WHERE id=?", (req_id,)).fetchone()
+    if not row: await event.edit("❌ Request nahi mili."); return
+    requester, days, status = row
+    if status != "pending": await event.edit("⚠️ Already processed."); return
+    await db_write("UPDATE code_requests SET status=? WHERE id=?", ("rejected", req_id))
+    await event.edit("❌ **Rejected.**")
+    try:
+        await bot.send_message(requester, "❌ **Code Request Reject Ho Gayi.**\nOwner ne approve nahi kiya.")
+    except Exception: pass
 
 @bot.on(events.NewMessage(pattern=r"^/extend\s+(\d+)\s+(\d+)$"))
 async def cmd_extend(event):
@@ -826,9 +957,6 @@ async def _do_broadcast(ctx, text):
 # ─────────────────────────── BUTTON HANDLERS ─────────────────
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "➕ Add Account"))
 async def btn_add(event): await cmd_addaccount(event)
-
-@bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "📱 Add Session"))
-async def btn_addsession(event): await cmd_addsession(event)
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "📊 My Groups"))
 async def btn_groups(event): await cmd_mygroups(event)
@@ -1019,7 +1147,7 @@ async def _create_task_cb(event, uid, iv_sec):
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"uinfo_")))
 async def cb_uinfo(event):
     if not is_admin(event.sender_id): return
-    await _show_userinfo(event, int(event.data.decode().replace("uinfo_", "")))
+    await _show_userinfo(event, int(event.data.decode().replace("uinfo_", "")), event.sender_id)
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"ugrp_")))
 async def cb_ugrp(event):
@@ -1222,9 +1350,134 @@ async def _show_schedules(ctx, uid, edit=False):
     if edit: await ctx.edit(txt[:4000], buttons=buttons)
     else:    await ctx.reply(txt[:4000], buttons=buttons)
 
+# ─────────────────────────── /protect SYSTEM ────────────────
+
+# /protect — Owner: SARE users protect/unprotect
+#            User: Apna account protect/unprotect
+@bot.on(events.NewMessage(pattern=r"^/protect$"))
+async def cmd_protect(event):
+    uid = event.sender_id
+
+    # ── OWNER: sab users ek saath protect ──
+    if is_super_admin(uid):
+        total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        prot  = c.execute("SELECT COUNT(*) FROM users WHERE is_protected=1").fetchone()[0]
+        if prot < total:
+            await db_write("UPDATE users SET is_protected=1", ())
+            new_prot = c.execute("SELECT COUNT(*) FROM users WHERE is_protected=1").fetchone()[0]
+            await event.reply(
+                "🔒 **Sab Users Protected!**\n\n"
+                "✅ " + str(new_prot) + "/" + str(total) + " users protect ho gaye.\n"
+                "✅ Sub admins kisi ki bhi details nahi dekh sakte.\n\n"
+                "/protect — sab unprotect karo\n"
+                "/pruser @username — specific user protect karo",
+                buttons=admin_kb()
+            )
+        else:
+            await db_write("UPDATE users SET is_protected=0", ())
+            await event.reply(
+                "🔓 **Sab Users Unprotected!**\n\n"
+                "✅ " + str(total) + " users ki protection hata di.\n\n"
+                "/protect — dobara sab protect karo\n"
+                "/pruser @username — specific user protect karo",
+                buttons=admin_kb()
+            )
+        return
+
+    # ── USER: apna account protect ──
+    row = c.execute("SELECT is_protected FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row: await event.reply("❌ Pehle /start karo."); return
+    current = row[0] or 0
+    if current:
+        await db_write("UPDATE users SET is_protected=0 WHERE user_id=?", (uid,))
+        await event.reply(
+            "🔓 **Tumhari Protection OFF Hui**\n\n"
+            "Tumhara data ab admin dekh sakta hai.\n"
+            "/protect — dobara protect karo."
+        )
+    else:
+        await db_write("UPDATE users SET is_protected=1 WHERE user_id=?", (uid,))
+        await event.reply(
+            "🔒 **Tumhara Account Protected!**\n\n"
+            "✅ Sirf Owner tumhari details dekh sakta hai.\n"
+            "✅ Sub admins tumhara data nahi dekh sakte.\n\n"
+            "/protect — protection hatao."
+        )
+
+# /pruser @username OR /pruser USER_ID — specific user protect (Owner only)
+@bot.on(events.NewMessage(pattern=r"^/pruser\s+(.+)$"))
+async def cmd_pruser(event):
+    if not is_super_admin(event.sender_id):
+        await event.reply("❌ Sirf Owner yeh kar sakta hai."); return
+    query = event.pattern_match.group(1).strip().lstrip("@")
+    # Try by user_id
+    if query.isdigit():
+        row = c.execute("SELECT user_id,username,is_protected FROM users WHERE user_id=?", (int(query),)).fetchone()
+    else:
+        row = c.execute("SELECT user_id,username,is_protected FROM users WHERE username=?", (query,)).fetchone()
+    if not row:
+        await event.reply(
+            "❌ User nahi mila: `" + query + "`\n\n"
+            "💡 User pehle bot pe /start kare.\n"
+            "   Ya user_id use karo: /pruser 123456789"
+        ); return
+    uid2, uname, is_prot = row
+    name = "@" + uname if uname else "`" + str(uid2) + "`"
+    if is_prot:
+        await db_write("UPDATE users SET is_protected=0 WHERE user_id=?", (uid2,))
+        await event.reply(
+            "🔓 **" + name + " Unprotected!**\n\n"
+            "Sub admins ab is user ki details dekh sakte hain.\n\n"
+            "/pruser " + str(uid2) + " — dobara protect karo",
+            buttons=admin_kb()
+        )
+        try:
+            await bot.send_message(uid2,
+                "🔓 **Tumhari Protection Hata Di Gayi**\n\n"
+                "Owner ne tumhara account unprotect kar diya.\n"
+                "/protect — dobara apni protection on karo."
+            )
+        except Exception: pass
+    else:
+        await db_write("UPDATE users SET is_protected=1 WHERE user_id=?", (uid2,))
+        await event.reply(
+            "🔒 **" + name + " Protected!**\n\n"
+            "✅ Sub admins ab is user ki details nahi dekhenge.\n\n"
+            "/pruser " + str(uid2) + " — unprotect karo",
+            buttons=admin_kb()
+        )
+        try:
+            await bot.send_message(uid2,
+                "🔒 **Owner Ne Tumhara Account Protect Kar Diya!**\n\n"
+                "✅ Sirf Owner tumhari details dekh sakta hai.\n"
+                "✅ Sub admins tumhara data access nahi kar sakte."
+            )
+        except Exception: pass
+
+# /protectedlist — sab protected users dekho (Owner only)
+@bot.on(events.NewMessage(pattern=r"^/protectedlist$"))
+async def cmd_protectedlist(event):
+    if not is_super_admin(event.sender_id):
+        await event.reply("❌ Sirf Owner dekh sakta hai."); return
+    rows = c.execute(
+        "SELECT user_id,username FROM users WHERE is_protected=1"
+    ).fetchall()
+    total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if not rows:
+        await event.reply(
+            "📋 **Protected Users:** 0/" + str(total) + "\n\nKoi protected nahi.\n/protect — sab protect karo",
+            buttons=admin_kb()
+        ); return
+    lines = ["🔒 **Protected Users** (" + str(len(rows)) + "/" + str(total) + ")\n"]
+    for uid2, uname in rows:
+        name = "@" + uname if uname else "ID:" + str(uid2)
+        lines.append("  🔒 " + name + " | `" + str(uid2) + "`")
+        lines.append("    /pruser " + str(uid2) + " — unprotect")
+    await event.reply("\n".join(lines), buttons=admin_kb())
+
 # ─────────────────────────── TEXT INPUT ──────────────────────
 SKIP = {
-    "➕ Add Account", "📱 Add Session", "📊 My Groups", "⏰ Schedule Msg",
+    "➕ Add Account", "📊 My Groups", "👑 Admins", "⏰ Schedule Msg",
     "🚀 Send Now", "📋 My Schedules", "🛑 Stop All", "⚙️ Settings",
     "🔑 Redeem Code", "🔧 Admin Panel", "👤 User Menu", "🔙 User Menu",
     "👥 Users", "📱 All Numbers", "🔑 Codes", "⏰ All Tasks",
@@ -1330,52 +1583,6 @@ async def on_text(event):
         except Exception as e:
             await close(cl); del pending[uid]
             await event.reply(f"❌ 2FA failed: {e}")
-
-    elif act == "add_session_phone":
-        if not text.startswith("+"):
-            await event.reply("❌ `+` se shuru karo (e.g. `+919876543210`)"); return
-        pending[uid]["phone"]  = text
-        pending[uid]["action"] = "add_session_string"
-        await event.reply(
-            f"✅ Phone: `{text}`\n\n"
-            "🔑 **Step 2:** Ab String Session paste karo\n\n"
-            "_Termux mein generate_session.py chalane ke baad_\n"
-            "_jo lamba string mila tha woh paste karo_\n\n"
-            "/cancel se wapas jao."
-        )
-
-    elif act == "add_session_string":
-        phone       = pending[uid].get("phone", "")
-        session_str = text.strip()
-        if len(session_str) < 50:
-            await event.reply("❌ Session string bahut chhoti hai. Sahi string paste karo."); return
-        verifying = await event.reply("🔍 Session verify ho raha hai...")
-        try:
-            cl = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            await cl.connect()
-            if not await cl.is_user_authorized():
-                await cl.disconnect()
-                del pending[uid]
-                await verifying.edit("❌ Session valid nahi. Dobara generate_session.py chalao."); return
-            me = await cl.get_me()
-            await cl.disconnect()
-            await db_write(
-                "INSERT OR REPLACE INTO user_accounts(user_id,phone,session_str) VALUES(?,?,?)",
-                (uid, phone, session_str)
-            )
-            cnt = c.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id=?", (uid,)).fetchone()[0]
-            del pending[uid]
-            await verifying.edit(
-                f"✅ **Account Add Ho Gaya!**\n\n"
-                f"👤 Name: {me.first_name}\n"
-                f"📱 Phone: `{phone}`\n"
-                f"📊 Accounts: {cnt}/{MAX_ACCOUNTS}\n\n"
-                f"Ab /mygroups se groups dekho!"
-            )
-            await event.reply("🎉 Ready!", buttons=main_kb())
-        except Exception as e:
-            del pending[uid]
-            await verifying.edit(f"❌ Session error: `{e}`\n\nDobara generate_session.py chalao.")
 
     elif act == "schedule_custom_iv":
         try:
