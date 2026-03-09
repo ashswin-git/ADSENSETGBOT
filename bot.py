@@ -664,27 +664,60 @@ async def _show_userinfo(ctx, uid, requester_id=None):
             "Is user ne apna data protect kiya hua hai.\n"
             "Sirf Owner details dekh sakta hai."
         ); return
-    _, uname, trial, texp, banned, joined = row
+    _, uname, trial, texp, banned, joined, is_prot2 = row
     phones = c.execute("SELECT phone,added_at FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
     code   = c.execute("SELECT code,expires_at FROM access_codes WHERE claimed_by=? AND is_active=1", (uid,)).fetchone()
     tasks  = c.execute("SELECT id,interval_seconds,is_active FROM scheduled_tasks WHERE user_id=?", (uid,)).fetchall()
-    name   = f"@{uname}" if uname else f"ID:{uid}"
-    status = ("🚫 BANNED" if banned else f"✅ {code[0]} exp {code[1].split('T')[0]}" if code else "🎁 Trial" if trial else "❌ No Access")
-    lines  = [f"👤 **{name}** | `{uid}`", f"🔐 {status}", f"\n📱 ({len(phones)}/3):"]
+    name      = f"@{uname}" if uname else f"ID:{uid}"
+    joined_dt = (joined or "").split("T")[0] or "?"
+    prot_icon = "🔒" if is_prot2 else "🔓"
+
+    if banned:
+        status = "🚫 BANNED"
+    elif code:
+        status = "✅ Active | " + code[0] + " | exp " + code[1].split("T")[0]
+    elif trial and texp and now_utc() <= parse_iso(texp):
+        status = "🎁 Trial | exp " + texp.split("T")[0]
+    else:
+        status = "❌ No Access"
+
+    out = (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👤 **" + name + "** | `" + str(uid) + "`\n"
+        "📅 Joined: " + joined_dt + "\n"
+        "🔐 " + status + "\n"
+        "" + prot_icon + " Protection: " + ("ON" if is_prot2 else "OFF") + "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📱 Accounts (" + str(len(phones)) + "/3):\n"
+    )
     for ph, ad in phones:
-        lines.append(f"  • `{ph}`  /removenum {ph}")
-    if not phones: lines.append("  Koi nahi")
-    lines.append(f"\n⏰ Tasks ({len(tasks)}):")
+        out += "  • `" + ph + "`\n"
+    if not phones:
+        out += "  Koi nahi\n"
+
+    out += "\n⏰ Tasks (" + str(len(tasks)) + "):\n"
     for tid, iv, act2 in tasks:
-        lines.append(f"  {'▶️' if act2 else '⏹'} #{tid} {fmt_mins(iv)}  /adminstoptask {tid}")
-    lines.append(f"\n/ban {uid}  /unban {uid}  /removeuser {uid}\n/extend {uid} 30")
-    await ctx.reply("\n".join(lines), buttons=[
-        [Button.inline("📊 Groups", f"ugrp_{uid}".encode()),
-         Button.inline("➕ Extend",  f"uext_{uid}".encode())],
-        [Button.inline("🚫 Ban",    f"uban_{uid}".encode()),
-         Button.inline("✅ Unban",  f"uunb_{uid}".encode())],
-        [Button.inline("🗑 Delete", f"udelc_{uid}".encode())],
-    ])
+        icon = "▶️" if act2 else "⏹"
+        out += "  " + icon + " #" + str(tid) + " " + fmt_mins(iv) + "  /adminstoptask " + str(tid) + "\n"
+    if not tasks:
+        out += "  Koi task nahi\n"
+
+    out += "━━━━━━━━━━━━━━━━━━━━━━\n"
+    out += "/ban " + str(uid) + "  /unban " + str(uid) + "  /removeuser " + str(uid)
+
+    btns = [
+        [Button.inline("📊 Groups",  ("ugrp_" + str(uid)).encode()),
+         Button.inline("➕ Extend",  ("uext_" + str(uid)).encode())],
+        [Button.inline("🚫 Ban",     ("uban_" + str(uid)).encode()),
+         Button.inline("✅ Unban",   ("uunb_" + str(uid)).encode())],
+        [Button.inline("🔒 Protect" if not is_prot2 else "🔓 Unprotect",
+                       ("upr_" + str(uid)).encode())],
+        [Button.inline("🗑 Delete",  ("udelc_" + str(uid)).encode())],
+    ]
+    try:
+        await ctx.edit(out, buttons=btns)
+    except Exception:
+        await ctx.reply(out, buttons=btns)
 
 @bot.on(events.NewMessage(pattern=r"^/ban\s+(\d+)$"))
 async def cmd_ban(event):
@@ -1147,7 +1180,9 @@ async def _create_task_cb(event, uid, iv_sec):
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"uinfo_")))
 async def cb_uinfo(event):
     if not is_admin(event.sender_id): return
-    await _show_userinfo(event, int(event.data.decode().replace("uinfo_", "")), event.sender_id)
+    await event.answer()  # instant response — stops loading spinner
+    uid = int(event.data.decode().replace("uinfo_", ""))
+    await _show_userinfo(event, uid, event.sender_id)
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"ugrp_")))
 async def cb_ugrp(event):
@@ -1186,14 +1221,28 @@ async def cb_uban(event):
     if not is_admin(event.sender_id): return
     uid = int(event.data.decode().replace("uban_", ""))
     await db_write("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
-    await event.edit(f"🚫 `{uid}` banned.")
+    await event.answer("🚫 Banned!")
+    await _show_userinfo(event, uid, event.sender_id)
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"uunb_")))
 async def cb_uunb(event):
     if not is_admin(event.sender_id): return
     uid = int(event.data.decode().replace("uunb_", ""))
     await db_write("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
-    await event.edit(f"✅ `{uid}` unbanned.")
+    await event.answer("✅ Unbanned!")
+    await _show_userinfo(event, uid, event.sender_id)
+
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"upr_")))
+async def cb_upr(event):
+    if not is_super_admin(event.sender_id):
+        await event.answer("❌ Sirf Owner!", alert=True); return
+    uid = int(event.data.decode().replace("upr_", ""))
+    row = c.execute("SELECT is_protected FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row: await event.answer("User nahi mila.", alert=True); return
+    new_val = 0 if row[0] else 1
+    await db_write("UPDATE users SET is_protected=? WHERE user_id=?", (new_val, uid))
+    await event.answer("🔒 Protected!" if new_val else "🔓 Unprotected!")
+    await _show_userinfo(event, uid, event.sender_id)
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"udelc_")))
 async def cb_udelc(event):
