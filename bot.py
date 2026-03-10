@@ -309,10 +309,20 @@ async def cmd_start(event):
     uname = getattr(event.sender, "username", "") or ""
     upsert_user(uid, uname)
 
+    if is_super_admin(uid):
+        await event.reply(
+            "👑 **Welcome Owner!**\n\n"
+            "🔑 Tumhare paas full control hai.\n"
+            "/help — saari commands",
+            buttons=admin_kb(uid)
+        ); return
+
     if is_admin(uid):
         await event.reply(
-            "👑 **Welcome Admin!**\n/help — saari commands",
-            buttons=[[Button.text("🔧 Admin Panel")], [Button.text("👤 User Menu")]]
+            "🔰 **Welcome Admin!**\n\n"
+            "✅ Tum Sub Admin ho.\n"
+            "/help — saari commands",
+            buttons=admin_kb(uid)
         ); return
 
     ok, tag = await check_access(uid)
@@ -1054,34 +1064,34 @@ async def cmd_gencode(event):
     await _do_gencode(event, int(m.group(1)), event.sender_id)
 
 async def _do_gencode(ctx, days, requester_id=None):
+    # requester_id se uid decide karo
+    uid = requester_id or ADMIN_ID
     # Super admin — direct generate
-    if requester_id is None or is_super_admin(requester_id):
+    if is_super_admin(uid):
         code    = gen_code()
         expires = (now_utc() + timedelta(days=days)).isoformat()
         await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at,created_by) VALUES(?,?,?,?,?)",
-            (code, days, now_iso(), expires, requester_id or ADMIN_ID))
-        # Get admin name for log
-        _rid = requester_id or ADMIN_ID
-        _urow = c.execute("SELECT username FROM users WHERE user_id=?", (_rid,)).fetchone()
+            (code, days, now_iso(), expires, uid))
+        _urow  = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
         _uname = _urow[0] if _urow and _urow[0] else ""
-        await log_event("code_created", _rid, "@" + _uname if _uname else str(_rid), code, str(days) + " days")
+        await log_event("code_created", uid, "@" + _uname if _uname else str(uid), code, str(days) + " days")
         await ctx.reply(
             "✅ **Code Generate Hua!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0] + "\n\n/redeem " + code,
-            buttons=admin_kb(event.sender_id)
+            buttons=admin_kb(uid)
         )
     else:
         # Sub admin — send approval request to owner
         req_id = await db_write(
             "INSERT INTO code_requests(requested_by,days) VALUES(?,?)",
-            (requester_id, days)
+            (uid, days)
         )
-        urow = c.execute("SELECT username FROM users WHERE user_id=?", (requester_id,)).fetchone()
+        urow  = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
         uname = urow[0] if urow and urow[0] else ""
-        name  = "@" + uname if uname else "`" + str(requester_id) + "`"
-        await log_event("code_created", requester_id, name, "", str(days) + " days (pending approval)")
+        name  = "@" + uname if uname else "`" + str(uid) + "`"
+        await log_event("code_created", uid, name, "", str(days) + " days (pending approval)")
         await ctx.reply(
             "⏳ **Request bheji gayi!**\n\nOwner verify karega tab code milega.",
-            buttons=admin_kb(event.sender_id)
+            buttons=admin_kb(uid)
         )
         # Notify super admin
         await bot.send_message(
