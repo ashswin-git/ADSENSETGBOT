@@ -352,43 +352,120 @@ async def cmd_start(event):
 @bot.on(events.NewMessage(pattern=r"^/help$"))
 async def cmd_help(event):
     uid = event.sender_id
-    u = (
-        "📖 **USER COMMANDS**\n\n"
-        "/start  /help  /cancel  /myid  /status\n"
-        "/redeem CODE\n"
-        "/addaccount — Phone se login\n"
-        "/removeaccount +phone\n"
-        "/mygroups\n"
-        "/sendnow message\n"
-        "/schedule\n"
-        "/myschedules\n"
+
+    # ── OWNER HELP ──
+    if is_super_admin(uid):
+        msg = (
+            "👑 **OWNER COMMANDS**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "**👥 User Management:**\n"
+            "/users — All users list\n"
+            "/userinfo ID — User details\n"
+            "/ban ID — Ban user\n"
+            "/unban ID — Unban user\n"
+            "/removeuser ID — Delete user\n"
+            "/endtrial ID — Trial khatam karo\n\n"
+            "**👑 Admin Management:**\n"
+            "/addadmin ID — New admin add karo\n"
+            "/removeadmin ID — Admin hatao\n"
+            "/admins — Admin list\n"
+            "/adminstats — Admin wise coupon stats\n\n"
+            "**🔑 Coupon / Code:**\n"
+            "/gencode DAYS — Direct code generate\n"
+            "/extend ID DAYS — Access extend karo\n"
+            "/revoke CODE — Code revoke karo\n"
+            "/codes — All codes (by admin)\n"
+            "/pending — Pending approval requests\n"
+            "/logs — Activity logs\n\n"
+            "**📊 Stats & Tasks:**\n"
+            "/stats — Bot statistics\n"
+            "/tasks — All tasks\n"
+            "/adminstoptask ID — Task stop karo\n"
+            "/adminstarttask ID — Task start karo\n"
+            "/admindeltask ID — Task delete karo\n"
+            "/usergroups ID — User ke groups dekho\n\n"
+            "**📱 Numbers:**\n"
+            "/numbers — All numbers\n"
+            "/removenum +phone — Number remove karo\n\n"
+            "**🔒 Protection:**\n"
+            "/protect — Sab users protect/unprotect\n"
+            "/pruser @username — Specific user protect\n"
+            "/protectedlist — Protected users list\n\n"
+            "**📢 Messaging:**\n"
+            "/sendmsg ID text — User ko message bhejo\n"
+            "/broadcast text — Sab ko broadcast karo\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "**🔧 General:**\n"
+            "/admin — Admin panel\n"
+            "/start /help /cancel /myid /status\n"
+            "/buy — Admin list show karo\n"
+        )
+        await event.reply(msg, buttons=admin_kb()); return
+
+    # ── SUB ADMIN HELP ──
+    if is_admin(uid):
+        msg = (
+            "🔰 **SUB ADMIN COMMANDS**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "**🔑 Coupon:**\n"
+            "/gencode DAYS — Code request karo (Owner approve karega)\n"
+            "/approval — Apni requests aur status dekho\n"
+            "/codes — Apne approved codes dekho\n\n"
+            "**👥 User Management:**\n"
+            "/users — Users list dekho\n"
+            "/userinfo ID — User details\n"
+            "/ban ID — Ban user\n"
+            "/unban ID — Unban user\n"
+            "/endtrial ID — Trial khatam karo\n"
+            "/numbers — Phone numbers\n\n"
+            "**📊 Tasks & Stats:**\n"
+            "/stats — Bot stats\n"
+            "/tasks — All tasks\n"
+            "/adminstoptask ID — Task stop karo\n"
+            "/adminstarttask ID — Task start karo\n"
+            "/usergroups ID — User ke groups\n\n"
+            "**📢 Messaging:**\n"
+            "/sendmsg ID text — User ko message\n"
+            "/broadcast text — Broadcast karo\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "**🔧 General:**\n"
+            "/admin — Admin panel\n"
+            "/start /help /cancel /myid /status\n"
+            "/buy — Admin list show karo\n"
+        )
+        await event.reply(msg, buttons=admin_kb()); return
+
+    # ── NORMAL USER HELP ──
+    msg = (
+        "📖 **USER COMMANDS**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "**🔐 Access:**\n"
+        "/start — Bot start karo\n"
+        "/status — Apna access status dekho\n"
+        "/redeem CODE — Access code lagao\n"
+        "/buy — Coupon/Code ke liye admin se contact karo\n\n"
+        "**📱 Account:**\n"
+        "/addaccount — Phone se account add karo\n"
+        "/removeaccount +phone — Account hatao\n"
+        "/mygroups — Apne groups dekho\n\n"
+        "**📤 Messaging:**\n"
+        "/sendnow message — Abhi sab groups mein bhejo\n"
+        "/schedule — Auto schedule banao\n"
+        "/myschedules — Apne schedules dekho\n\n"
+        "**⏰ Tasks:**\n"
         "/starttask ID — Task start karo\n"
-        "/stoptask ID  /deltask ID  /stopall\n"
-        "/settings\n"
+        "/stoptask ID — Task stop karo\n"
+        "/deltask ID — Task delete karo\n"
+        "/stopall — Sab tasks stop karo\n\n"
+        "**⚙️ Other:**\n"
+        "/settings — Settings dekho\n"
         "/protect — Apna account protect karo\n"
-        "/buy — Admin list dekho (coupon ke liye)\n"
+        "/myid — Apna Telegram ID dekho\n"
+        "/cancel — Cancel karo\n"
+        "/help — Yeh menu\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
     )
-    a = (
-        "\n👑 **ADMIN COMMANDS**\n\n"
-        "/admin  /stats\n"
-        "/addadmin ID  /removeadmin ID  /admins\n"
-        "/users  /userinfo ID\n"
-        "/ban ID  /unban ID  /removeuser ID\n"
-        "/gencode DAYS — Owner approve karega\n"
-        "/approval — Apni requests dekho (sub admin)\n"
-        "/extend ID DAYS  /revoke CODE  /codes\n"
-        "/endtrial ID — User ka trial khatam karo\n"
-        "/numbers  /removenum +phone\n"
-        "/tasks  /adminstoptask ID  /admindeltask ID\n"
-        "/adminstarttask ID — Stopped task start karo\n"
-        "/usergroups ID\n"
-        "/sendmsg ID text  /broadcast text\n"
-        "\n🔒 **PROTECTION**\n"
-        "/protect — Sab users protect/unprotect\n"
-        "/pruser @username — Specific user protect\n"
-        "/protectedlist — Protected users list\n"
-    )
-    await event.reply(u + (a if is_admin(uid) else ""))
+    await event.reply(msg, buttons=main_kb())
 
 # ─────────────────────────── /cancel ─────────────────────────
 @bot.on(events.NewMessage(pattern=r"^/cancel$"))
@@ -2033,7 +2110,7 @@ async def on_text(event):
         try:
             days = int(text)
             if days < 1: raise ValueError
-            del pending[uid]; await _do_gencode(event, days)
+            del pending[uid]; await _do_gencode(event, days, uid)  # ← uid pass karo!
         except ValueError: await event.reply("❌ Number bhejo (e.g. `30`)")
 
     elif act == "admin_extend":
