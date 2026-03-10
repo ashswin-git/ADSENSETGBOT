@@ -74,9 +74,20 @@ c.execute("""CREATE TABLE IF NOT EXISTS code_requests(
     status       TEXT DEFAULT 'pending',
     code         TEXT DEFAULT '',
     requested_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
-# Add is_protected column if not exists
+c.execute("""CREATE TABLE IF NOT EXISTS logs(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT,
+    admin_id   INTEGER,
+    admin_name TEXT,
+    code       TEXT    DEFAULT '',
+    details    TEXT    DEFAULT '',
+    created_at TEXT    DEFAULT CURRENT_TIMESTAMP)""")
+# Add columns if not exists
 try:
     c.execute("ALTER TABLE users ADD COLUMN is_protected INTEGER DEFAULT 0")
+except Exception: pass
+try:
+    c.execute("ALTER TABLE access_codes ADD COLUMN created_by INTEGER DEFAULT NULL")
 except Exception: pass
 conn.commit()
 
@@ -99,6 +110,13 @@ async def db_write(sql, params=()):
         c.execute(sql, params)
         conn.commit()
         return c.lastrowid
+
+async def log_event(event_type, admin_id, admin_name, code="", details=""):
+    """Log important events: code_created, code_approved, code_claimed"""
+    await db_write(
+        "INSERT INTO logs(event_type,admin_id,admin_name,code,details) VALUES(?,?,?,?,?)",
+        (event_type, admin_id, admin_name, code, details)
+    )
 
 def now_utc():    return datetime.utcnow()
 def now_iso():    return now_utc().isoformat()
@@ -165,14 +183,18 @@ def main_kb():
         [Button.text("🔑 Redeem Code")],
     ]
 
-def admin_kb():
-    return [
-        [Button.text("👥 Users"),     Button.text("📱 All Numbers")],
-        [Button.text("🔑 Codes"),     Button.text("⏰ All Tasks")],
-        [Button.text("➕ Gen Code"),  Button.text("📊 Stats")],
-        [Button.text("📢 Broadcast"), Button.text("👑 Admins")],
+def admin_kb(uid=None):
+    pending_cnt = c.execute("SELECT COUNT(*) FROM code_requests WHERE status='pending'").fetchone()[0]
+    pending_btn = "📋 Pending (" + str(pending_cnt) + ")" if pending_cnt > 0 else "📋 Pending"
+    base = [
+        [Button.text("👥 Users"),        Button.text("📱 All Numbers")],
+        [Button.text("🔑 Codes"),        Button.text("⏰ All Tasks")],
+        [Button.text("➕ Gen Code"),     Button.text("📊 Stats")],
+        [Button.text("📢 Broadcast"),    Button.text("👑 Admins")],
+        [Button.text(pending_btn),       Button.text("📜 Logs")],
         [Button.text("🔙 User Menu")],
     ]
+    return base
 
 def action_btns():
     return [
@@ -344,6 +366,7 @@ async def cmd_help(event):
         "/stoptask ID  /deltask ID  /stopall\n"
         "/settings\n"
         "/protect — Apna account protect karo\n"
+        "/buy — Admin list dekho (coupon ke liye)\n"
     )
     a = (
         "\n👑 **ADMIN COMMANDS**\n\n"
@@ -352,6 +375,7 @@ async def cmd_help(event):
         "/users  /userinfo ID\n"
         "/ban ID  /unban ID  /removeuser ID\n"
         "/gencode DAYS — Owner approve karega\n"
+        "/approval — Apni requests dekho (sub admin)\n"
         "/extend ID DAYS  /revoke CODE  /codes\n"
         "/endtrial ID — User ka trial khatam karo\n"
         "/numbers  /removenum +phone\n"
@@ -577,14 +601,72 @@ async def cmd_addadmin(event):
     uid = int(event.pattern_match.group(1))
     if uid == ADMIN_ID:
         await event.reply("⚠️ Yeh already Super Admin hai."); return
+    # Try to get username from DB first, then from Telegram
     urow = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
     uname = urow[0] if urow and urow[0] else ""
-    await db_write("INSERT OR REPLACE INTO admins(user_id,username,added_by) VALUES(?,?,?)",
-        (uid, uname, event.sender_id))
-    name = f"@{uname}" if uname else f"`{uid}`"
-    name = f"@{uname}" if uname else f"`{uid}`"
-    msg = "✅ " + name + " Admin ban gaya!\n\n🔰 Woh admin panel use kar sakta hai.\n⚠️ Woh naye admin nahi bana sakta.\n\n/removeadmin " + str(uid)
+    if not uname:
+        try:
+            tg_user = await bot.get_entity(uid)
+            uname = tg_user.username or ""
+        except Exception: pass
+    # Save/update user in users table too
+    if not c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone():
+        c.execute("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)", (uid, uname))
+        conn.commit()
+    else:
+        if uname:
+            c.execute("UPDATE users SET username=? WHERE user_id=?", (uname, uid))
+            conn.commit()
+    await db_write("INSERT OR REPLACE INTO admins(user_id,username,added_by,added_at) VALUES(?,?,?,?)",
+        (uid, uname, event.sender_id, now_iso()))
+    name = "@" + uname if uname else "`" + str(uid) + "`"
+    msg = (
+        "✅ **" + name + " Admin ban gaya!**\n\n"
+        "🆔 ID: `" + str(uid) + "`\n"
+        "👤 Username: " + ("@" + uname if uname else "—") + "\n"
+        "⚙️ Permissions:\n"
+        "  ✅ Admin panel use kar sakta hai\n"
+        "  ✅ Coupon request kar sakta hai (Owner approve karega)\n"
+        "  ✅ Apne codes dekh sakta hai\n"
+        "  ❌ Naye admin nahi bana sakta\n\n"
+        "/removeadmin " + str(uid) + " — hatane ke liye"
+    )
     await event.reply(msg, buttons=admin_kb())
+    # Notify the new admin
+    try:
+        await bot.send_message(uid,
+            "🎉 **Tumhe Admin Banaya Gaya!**\n\n"
+            "👑 Bot: @V4_XTRD_bot\n"
+            "🔰 Role: Sub Admin\n\n"
+            "Ab tum /admin se admin panel access kar sakte ho.\n"
+            "/help se saari commands dekho."
+        )
+    except Exception: pass
+
+@bot.on(events.NewMessage(pattern=r"^/buy$"))
+async def cmd_buy(event):
+    # Build dynamic admin list from DB
+    rows = c.execute("SELECT user_id, username FROM admins").fetchall()
+    # Add owner info
+    owner_row = c.execute("SELECT username FROM users WHERE user_id=?", (ADMIN_ID,)).fetchone()
+    owner_name = owner_row[0] if owner_row and owner_row[0] else None
+
+    lines = [
+        "💬 **DM Any Admin For Coupon / Best Price**\n",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "👑 **Owner:**",
+        "  • " + ("@" + owner_name if owner_name else "`" + str(ADMIN_ID) + "`"),
+    ]
+    if rows:
+        lines.append("\n🔰 **Admins:**")
+        for uid2, uname in rows:
+            if uname:
+                lines.append("  • @" + uname)
+            else:
+                lines.append("  • `" + str(uid2) + "`")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 _Admin ko DM karo aur best deal pao!_")
+    await event.reply("\n".join(lines))
 
 @bot.on(events.NewMessage(pattern=r"^/removeadmin\s+(\d+)$"))
 async def cmd_removeadmin(event):
@@ -637,12 +719,108 @@ async def cmd_stats(event):
     phones = c.execute("SELECT COUNT(*) FROM user_accounts").fetchone()[0]
     codes  = c.execute("SELECT COUNT(*) FROM access_codes").fetchone()[0]
     actc   = c.execute("SELECT COUNT(*) FROM access_codes WHERE is_active=1 AND expires_at>?", (now_iso(),)).fetchone()[0]
+    claimed= c.execute("SELECT COUNT(*) FROM access_codes WHERE claimed_by IS NOT NULL").fetchone()[0]
     tasks  = c.execute("SELECT COUNT(*) FROM scheduled_tasks WHERE is_active=1").fetchone()[0]
-    await event.reply(
-        f"📊 **Stats**\n\nUsers: `{total}` | Banned: `{banned}`\nTrials: `{trials}`\n"
-        f"Numbers: `{phones}`\nCodes: `{codes}` (active: `{actc}`)\nRunning Tasks: `{tasks}`",
-        buttons=admin_kb()
+    pending_req = c.execute("SELECT COUNT(*) FROM code_requests WHERE status='pending'").fetchone()[0]
+    admins_cnt  = c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
+
+    out = (
+        "📊 **Bot Statistics**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👥 Total Users: `" + str(total) + "` | 🚫 Banned: `" + str(banned) + "`\n"
+        "🎁 Active Trials: `" + str(trials) + "`\n"
+        "📱 Numbers: `" + str(phones) + "`\n"
+        "⏰ Running Tasks: `" + str(tasks) + "`\n"
+        "👑 Sub Admins: `" + str(admins_cnt) + "`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔑 **Coupon Stats:**\n"
+        "  Total: `" + str(codes) + "` | Active: `" + str(actc) + "`\n"
+        "  ✅ Claimed: `" + str(claimed) + "` | 🟢 Unclaimed: `" + str(actc - claimed) + "`\n"
+        "  ⏳ Pending Approval: `" + str(pending_req) + "`\n"
     )
+
+    # Admin coupon breakdown (owner only)
+    if is_super_admin(event.sender_id):
+        out += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        out += "📋 **Coupons By Admin:**\n"
+        # Owner codes
+        owner_cnt = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=?", (ADMIN_ID,)).fetchone()[0]
+        owner_row = c.execute("SELECT username FROM users WHERE user_id=?", (ADMIN_ID,)).fetchone()
+        owner_uname = owner_row[0] if owner_row and owner_row[0] else ""
+        out += "  👑 " + ("@" + owner_uname if owner_uname else "Owner") + " | ID: `" + str(ADMIN_ID) + "`\n"
+        out += "     Total Coupons Created: **" + str(owner_cnt) + "**\n\n"
+        # Sub admin codes
+        admin_rows = c.execute("SELECT user_id,username FROM admins").fetchall()
+        for aid, auname in admin_rows:
+            cnt  = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=?", (aid,)).fetchone()[0]
+            clm  = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=? AND claimed_by IS NOT NULL", (aid,)).fetchone()[0]
+            pend = c.execute("SELECT COUNT(*) FROM code_requests WHERE requested_by=? AND status='pending'", (aid,)).fetchone()[0]
+            name = "@" + auname if auname else "ID:" + str(aid)
+            out += "  🔰 " + name + " | ID: `" + str(aid) + "`\n"
+            out += "     Total Created: **" + str(cnt) + "** | Claimed: **" + str(clm) + "** | Pending: **" + str(pend) + "**\n\n"
+
+    await event.reply(out[:4000], buttons=admin_kb())
+
+@bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/logs", "📜 Logs"]))
+async def cmd_logs(event):
+    if not is_super_admin(event.sender_id): return
+    rows = c.execute(
+        "SELECT event_type,admin_name,admin_id,code,details,created_at FROM logs ORDER BY id DESC LIMIT 30"
+    ).fetchall()
+    if not rows:
+        await event.reply("📜 **Logs**\n\nKoi log nahi abhi tak.", buttons=admin_kb()); return
+    icons = {"code_created": "🆕", "code_approved": "✅", "code_claimed": "🔑", "code_rejected": "❌"}
+    lines = ["📜 **Recent Logs** (last 30)\n"]
+    for etype, aname, aid, code, details, created in rows:
+        icon = icons.get(etype, "📌")
+        date = (created or "").replace("T", " ").split(".")[0]
+        lines.append(
+            icon + " **" + etype.replace("_", " ").title() + "**\n"
+            "   👤 " + (aname or "—") + " | `" + str(aid) + "`\n"
+            "   🔑 `" + (code or "—") + "`\n"
+            "   📝 " + (details or "—") + "\n"
+            "   🕐 " + date
+        )
+    await event.reply("\n\n".join(lines)[:4000], buttons=admin_kb())
+
+@bot.on(events.NewMessage(pattern=r"^/adminstats$"))
+async def cmd_adminstats(event):
+    if not is_super_admin(event.sender_id): return
+    out = "📋 **Admin Coupon Statistics**\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    # Owner stats
+    o_total   = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=?", (ADMIN_ID,)).fetchone()[0]
+    o_claimed = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=? AND claimed_by IS NOT NULL", (ADMIN_ID,)).fetchone()[0]
+    o_active  = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=? AND is_active=1 AND expires_at>?", (ADMIN_ID, now_iso())).fetchone()[0]
+    orow = c.execute("SELECT username FROM users WHERE user_id=?", (ADMIN_ID,)).fetchone()
+    oname = "@" + orow[0] if orow and orow[0] else "Owner"
+    out += (
+        "👑 **Admin:** " + oname + "\n"
+        "   🆔 Admin ID: `" + str(ADMIN_ID) + "`\n"
+        "   🔑 Total Coupons Created: **" + str(o_total) + "**\n"
+        "   ✅ Claimed: **" + str(o_claimed) + "** | 🟢 Unclaimed: **" + str(o_active - o_claimed) + "**\n\n"
+    )
+    # Sub admin stats
+    admin_rows = c.execute("SELECT user_id,username FROM admins").fetchall()
+    if admin_rows:
+        for aid, auname in admin_rows:
+            total_req  = c.execute("SELECT COUNT(*) FROM code_requests WHERE requested_by=?", (aid,)).fetchone()[0]
+            approved   = c.execute("SELECT COUNT(*) FROM code_requests WHERE requested_by=? AND status='approved'", (aid,)).fetchone()[0]
+            pending    = c.execute("SELECT COUNT(*) FROM code_requests WHERE requested_by=? AND status='pending'", (aid,)).fetchone()[0]
+            rejected   = c.execute("SELECT COUNT(*) FROM code_requests WHERE requested_by=? AND status='rejected'", (aid,)).fetchone()[0]
+            ac_claimed = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=? AND claimed_by IS NOT NULL", (aid,)).fetchone()[0]
+            ac_active  = c.execute("SELECT COUNT(*) FROM access_codes WHERE created_by=? AND is_active=1 AND expires_at>?", (aid, now_iso())).fetchone()[0]
+            name = "@" + auname if auname else "ID:" + str(aid)
+            out += (
+                "🔰 **Admin:** " + name + "\n"
+                "   🆔 Admin ID: `" + str(aid) + "`\n"
+                "   📨 Total Requests: **" + str(total_req) + "**\n"
+                "   ✅ Approved: **" + str(approved) + "** | ❌ Rejected: **" + str(rejected) + "** | ⏳ Pending: **" + str(pending) + "**\n"
+                "   🔑 Active Codes: **" + str(ac_active) + "** | Claimed: **" + str(ac_claimed) + "**\n\n"
+            )
+    else:
+        out += "🔰 Koi sub admin nahi.\n"
+    out += "━━━━━━━━━━━━━━━━━━━━━━"
+    await event.reply(out[:4000], buttons=admin_kb())
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/users", "👥 Users"]))
 async def cmd_users(event):
@@ -791,8 +969,13 @@ async def _do_gencode(ctx, days, requester_id=None):
     if requester_id is None or is_super_admin(requester_id):
         code    = gen_code()
         expires = (now_utc() + timedelta(days=days)).isoformat()
-        await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at) VALUES(?,?,?,?)",
-            (code, days, now_iso(), expires))
+        await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at,created_by) VALUES(?,?,?,?,?)",
+            (code, days, now_iso(), expires, requester_id or ADMIN_ID))
+        # Get admin name for log
+        _rid = requester_id or ADMIN_ID
+        _urow = c.execute("SELECT username FROM users WHERE user_id=?", (_rid,)).fetchone()
+        _uname = _urow[0] if _urow and _urow[0] else ""
+        await log_event("code_created", _rid, "@" + _uname if _uname else str(_rid), code, str(days) + " days")
         await ctx.reply(
             "✅ **Code Generate Hua!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0] + "\n\n/redeem " + code,
             buttons=admin_kb()
@@ -806,6 +989,7 @@ async def _do_gencode(ctx, days, requester_id=None):
         urow = c.execute("SELECT username FROM users WHERE user_id=?", (requester_id,)).fetchone()
         uname = urow[0] if urow and urow[0] else ""
         name  = "@" + uname if uname else "`" + str(requester_id) + "`"
+        await log_event("code_created", requester_id, name, "", str(days) + " days (pending approval)")
         await ctx.reply(
             "⏳ **Request bheji gayi!**\n\nOwner verify karega tab code milega.",
             buttons=admin_kb()
@@ -823,6 +1007,79 @@ async def _do_gencode(ctx, days, requester_id=None):
             ]
         )
 
+# ── /pending — show all pending requests ──────────────────────
+@bot.on(events.NewMessage(func=lambda e: e.text and (
+    e.text.strip().startswith("📋 Pending") or e.text.strip() == "/pending"
+)))
+async def cmd_pending(event):
+    if not is_super_admin(event.sender_id): return
+    rows = c.execute(
+        "SELECT cr.id, cr.requested_by, u.username, cr.days, cr.requested_at "
+        "FROM code_requests cr LEFT JOIN users u ON cr.requested_by=u.user_id "
+        "WHERE cr.status='pending' ORDER BY cr.id ASC"
+    ).fetchall()
+    if not rows:
+        await event.reply("📋 **Pending Requests**\n\nKoi pending request nahi hai! ✅", buttons=admin_kb()); return
+    lines2  = ["📋 **Pending Code Requests** (" + str(len(rows)) + ")\n"]
+    buttons = []
+    for req_id, req_by, uname, days, req_at in rows:
+        name = "@" + uname if uname else "ID:" + str(req_by)
+        date = (req_at or "").split("T")[0]
+        lines2.append(
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔔 **Request #" + str(req_id) + "**\n"
+            "👤 Admin: " + name + " | `" + str(req_by) + "`\n"
+            "📅 Days: **" + str(days) + "**\n"
+            "🕐 Date: " + date
+        )
+        buttons.append([
+            Button.inline("✅ Approve #" + str(req_id), ("creq_ok_" + str(req_id)).encode()),
+            Button.inline("❌ Reject #" + str(req_id),  ("creq_no_" + str(req_id)).encode()),
+        ])
+    buttons.append([
+        Button.inline("✅ Approve ALL", b"creq_all_ok"),
+        Button.inline("❌ Reject ALL",  b"creq_all_no"),
+    ])
+    await event.reply("\n\n".join(lines2), buttons=buttons)
+
+# Approve ALL
+@bot.on(events.CallbackQuery(data=b"creq_all_ok"))
+async def cb_creq_all_ok(event):
+    if not is_super_admin(event.sender_id): return
+    rows = c.execute("SELECT id,requested_by,days FROM code_requests WHERE status='pending'").fetchall()
+    if not rows: await event.answer("Koi pending nahi.", alert=True); return
+    done = 0
+    for req_id, requester, days in rows:
+        code    = gen_code()
+        expires = (now_utc() + timedelta(days=days)).isoformat()
+        await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at,created_by) VALUES(?,?,?,?,?)",
+            (code, days, now_iso(), expires, requester))
+        await db_write("UPDATE code_requests SET status=?,code=? WHERE id=?", ("approved", code, req_id))
+        try:
+            await bot.send_message(requester,
+                "✅ **Code Approved By Owner!**\n\n"
+                "🔑 `" + code + "`\n"
+                "📅 " + str(days) + " din\n"
+                "⏳ " + expires.split("T")[0] + "\n\n"
+                "/redeem " + code
+            )
+        except Exception: pass
+        done += 1
+    await event.edit("✅ **" + str(done) + " requests approve ho gayi!**", buttons=admin_kb())
+
+# Reject ALL
+@bot.on(events.CallbackQuery(data=b"creq_all_no"))
+async def cb_creq_all_no(event):
+    if not is_super_admin(event.sender_id): return
+    rows = c.execute("SELECT id,requested_by FROM code_requests WHERE status='pending'").fetchall()
+    if not rows: await event.answer("Koi pending nahi.", alert=True); return
+    for req_id, requester in rows:
+        await db_write("UPDATE code_requests SET status='rejected' WHERE id=?", (req_id,))
+        try:
+            await bot.send_message(requester, "❌ **Code Request Reject Ho Gayi.**\nOwner ne approve nahi kiya.")
+        except Exception: pass
+    await event.edit("❌ **" + str(len(rows)) + " requests reject ho gayi.**", buttons=admin_kb())
+
 # Approve callback
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"creq_ok_")))
 async def cb_creq_ok(event):
@@ -834,16 +1091,28 @@ async def cb_creq_ok(event):
     if status != "pending": await event.edit("⚠️ Already processed."); return
     code    = gen_code()
     expires = (now_utc() + timedelta(days=days)).isoformat()
-    await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at) VALUES(?,?,?,?)",
-        (code, days, now_iso(), expires))
+    await db_write("INSERT INTO access_codes(code,days_valid,created_at,expires_at,created_by) VALUES(?,?,?,?,?)",
+        (code, days, now_iso(), expires, requester))
     await db_write("UPDATE code_requests SET status=?,code=? WHERE id=?", ("approved", code, req_id))
+    # Log approval
+    _urow2 = c.execute("SELECT username FROM users WHERE user_id=?", (requester,)).fetchone()
+    _un2   = _urow2[0] if _urow2 and _urow2[0] else ""
+    await log_event("code_approved", ADMIN_ID, "Owner", code, "Approved for " + ("@" + _un2 if _un2 else str(requester)) + " | " + str(days) + " days")
+    remaining = c.execute("SELECT COUNT(*) FROM code_requests WHERE status='pending'").fetchone()[0]
     await event.edit(
-        "✅ **Approved!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0]
+        "✅ **Approved!**\n\n"
+        "🔑 `" + code + "`\n"
+        "📅 " + str(days) + " din\n"
+        "⏳ " + expires.split("T")[0] + "\n\n"
+        "📋 Remaining pending: " + str(remaining)
     )
     try:
-        await bot.send_message(
-            requester,
-            "✅ **Code Approved By Owner!**\n\n🔑 `" + code + "`\n📅 " + str(days) + " din\n⏳ " + expires.split("T")[0] + "\n\n/redeem " + code
+        await bot.send_message(requester,
+            "✅ **Code Approved By Owner!**\n\n"
+            "🔑 `" + code + "`\n"
+            "📅 " + str(days) + " din\n"
+            "⏳ " + expires.split("T")[0] + "\n\n"
+            "/redeem " + code
         )
     except Exception: pass
 
@@ -857,10 +1126,89 @@ async def cb_creq_no(event):
     requester, days, status = row
     if status != "pending": await event.edit("⚠️ Already processed."); return
     await db_write("UPDATE code_requests SET status=? WHERE id=?", ("rejected", req_id))
-    await event.edit("❌ **Rejected.**")
+    _urow3 = c.execute("SELECT username FROM users WHERE user_id=?", (requester,)).fetchone()
+    _un3   = _urow3[0] if _urow3 and _urow3[0] else ""
+    await log_event("code_rejected", ADMIN_ID, "Owner", "", "Rejected request from " + ("@" + _un3 if _un3 else str(requester)) + " | " + str(days) + " days")
+    remaining = c.execute("SELECT COUNT(*) FROM code_requests WHERE status='pending'").fetchone()[0]
+    await event.edit("❌ **Rejected.**\n\n📋 Remaining pending: " + str(remaining))
     try:
         await bot.send_message(requester, "❌ **Code Request Reject Ho Gayi.**\nOwner ne approve nahi kiya.")
     except Exception: pass
+
+# ─────────────────────────── ADMIN COMMANDS PART 2 ──────────
+@bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/codes", "🔑 Codes"]))
+async def cmd_codes(event):
+    if not is_admin(event.sender_id): return
+    uid = event.sender_id
+    if not is_super_admin(uid):
+        # Sub admin: only own approved codes
+        rows = c.execute(
+            "SELECT code,days_valid,claimed_by,expires_at,is_active FROM access_codes WHERE created_by=? ORDER BY rowid DESC", (uid,)
+        ).fetchall()
+        if not rows:
+            await event.reply("🔑 **Tumhare Codes**\n\nAbhi tak koi code approve nahi hua.", buttons=admin_kb()); return
+        lines2 = ["🔑 **Tumhare Approved Codes** (" + str(len(rows)) + ")\n"]
+        for code, days, cb, exp, active in rows:
+            expired = now_utc() > parse_iso(exp)
+            if not active:    st = "🚫 Revoked"
+            elif expired:     st = "⌛ Expired"
+            elif cb:          st = "✅ Claimed"
+            else:             st = "🟢 Unclaimed"
+            urow = c.execute("SELECT username FROM users WHERE user_id=?", (cb,)).fetchone() if cb else None
+            claimant = ("@" + urow[0] if urow and urow[0] else "`" + str(cb) + "`") if cb else "—"
+            lines2.append("━━━━━━━━━━━━\n" + st + " `" + code + "`\n📅 " + str(days) + "d | ⏳ " + exp.split("T")[0] + "\n👤 " + claimant)
+        await event.reply("\n\n".join(lines2), buttons=admin_kb()); return
+    # Owner: codes grouped by admin
+    all_sections = [(ADMIN_ID, "👑 Owner (You)")]
+    for aid, auname in c.execute("SELECT user_id,username FROM admins").fetchall():
+        all_sections.append((aid, "🔰 @" + auname if auname else "🔰 ID:" + str(aid)))
+    full_text = "🔑 **All Codes By Admin**\n\n"
+    buttons   = []
+    for admin_id, admin_name in all_sections:
+        rows = c.execute(
+            "SELECT code,days_valid,claimed_by,expires_at,is_active FROM access_codes WHERE created_by=? ORDER BY rowid DESC LIMIT 15", (admin_id,)
+        ).fetchall()
+        if not rows: continue
+        full_text += "━━━━━━━━━━━━━━━━━━━━━━\n" + admin_name + "  (" + str(len(rows)) + " codes)\n\n"
+        for code, days, cb, exp, active in rows:
+            expired = now_utc() > parse_iso(exp)
+            if not active:  st = "🚫"
+            elif expired:   st = "⌛"
+            elif cb:        st = "✅ Claimed"
+            else:           st = "🟢 Unclaimed"
+            full_text += st + " `" + code + "` | " + str(days) + "d | " + exp.split("T")[0] + "\n"
+            if active and not expired:
+                buttons.append([Button.inline("🚫 Revoke " + code, ("rev_" + code).encode())])
+        full_text += "\n"
+    if full_text == "🔑 **All Codes By Admin**\n\n":
+        await event.reply("Koi code nahi.", buttons=admin_kb()); return
+    await event.reply(full_text[:4000], buttons=buttons or None)
+
+@bot.on(events.NewMessage(pattern=r"^/approval$"))
+async def cmd_approval(event):
+    uid = event.sender_id
+    if not is_admin(uid): return
+    if is_super_admin(uid):
+        await cmd_pending(event); return
+    rows = c.execute(
+        "SELECT id,days,status,code,requested_at FROM code_requests WHERE requested_by=? ORDER BY id DESC", (uid,)
+    ).fetchall()
+    if not rows:
+        await event.reply("📋 **Tumhari Requests**\n\nAbhi tak koi request nahi bheji.", buttons=admin_kb()); return
+    p = sum(1 for r in rows if r[2]=="pending")
+    a = sum(1 for r in rows if r[2]=="approved")
+    rj = sum(1 for r in rows if r[2]=="rejected")
+    lines2 = ["📋 **Tumhari Code Requests**\n\n⏳ Pending: " + str(p) + "  ✅ Approved: " + str(a) + "  ❌ Rejected: " + str(rj) + "\n"]
+    for req_id, days, status, code, req_at in rows:
+        date = (req_at or "").split("T")[0]
+        st = "⏳ Pending" if status=="pending" else ("✅ Approved" if status=="approved" else "❌ Rejected")
+        line = "━━━━━━━━━━━━\n" + st + " **#" + str(req_id) + "** | " + str(days) + " din | " + date
+        if status == "approved" and code:
+            claimed = c.execute("SELECT claimed_by FROM access_codes WHERE code=?", (code,)).fetchone()
+            clm = "✅ Claimed" if (claimed and claimed[0]) else "🟢 Unclaimed"
+            line += "\n🔑 `" + code + "` — " + clm
+        lines2.append(line)
+    await event.reply("\n\n".join(lines2)[:4000], buttons=admin_kb())
 
 @bot.on(events.NewMessage(pattern=r"^/extend\s+(\d+)\s+(\d+)$"))
 async def cmd_extend(event):
@@ -871,70 +1219,70 @@ async def _do_extend(ctx, target_uid, days):
     row = c.execute("SELECT code,expires_at FROM access_codes WHERE claimed_by=? AND is_active=1", (target_uid,)).fetchone()
     if row:
         new_exp = (parse_iso(row[1]) + timedelta(days=days)).isoformat()
-        await db_write("UPDATE access_codes SET expires_at=?,days_valid=days_valid+? WHERE code=?",
-            (new_exp, days, row[0]))
-        await ctx.reply(f"✅ `{target_uid}` +{days} din. New expiry: {new_exp.split('T')[0]}", buttons=admin_kb())
+        await db_write("UPDATE access_codes SET expires_at=?,days_valid=days_valid+? WHERE code=?", (new_exp, days, row[0]))
+        await ctx.reply("✅ `" + str(target_uid) + "` +" + str(days) + " din. Expiry: " + new_exp.split("T")[0], buttons=admin_kb())
     else:
         code    = gen_code()
         expires = (now_utc() + timedelta(days=days)).isoformat()
-        await db_write("INSERT INTO access_codes(code,days_valid,created_at,claimed_by,claimed_at,expires_at) VALUES(?,?,?,?,?,?)",
-            (code, days, now_iso(), target_uid, now_iso(), expires))
-        await ctx.reply(f"✅ Code `{code}` → user `{target_uid}`. Expiry: {expires.split('T')[0]}", buttons=admin_kb())
+        await db_write("INSERT INTO access_codes(code,days_valid,created_at,claimed_by,claimed_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?)",
+            (code, days, now_iso(), target_uid, now_iso(), expires, event.sender_id if hasattr(ctx,'sender_id') else ADMIN_ID))
+        await ctx.reply("✅ Code `" + code + "` given to `" + str(target_uid) + "`. Expiry: " + expires.split("T")[0], buttons=admin_kb())
 
 @bot.on(events.NewMessage(pattern=r"^/revoke\s+(\S+)$"))
 async def cmd_revoke(event):
     if not is_admin(event.sender_id): return
     code = event.pattern_match.group(1).upper()
     await db_write("UPDATE access_codes SET is_active=0 WHERE code=?", (code,))
-    await event.reply(f"🚫 `{code}` revoked.", buttons=admin_kb())
-
-@bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/codes", "🔑 Codes"]))
-async def cmd_codes(event):
-    if not is_admin(event.sender_id): return
-    rows = c.execute("SELECT code,days_valid,claimed_by,expires_at,is_active FROM access_codes ORDER BY rowid DESC LIMIT 20").fetchall()
-    if not rows: await event.reply("Koi code nahi.", buttons=admin_kb()); return
-    lines = ["🔑 **Codes** (last 20)\n"]
-    buttons = []
-    for code, days, cb, exp, active in rows:
-        st = "🚫" if not active else ("❌" if now_utc() > parse_iso(exp) else "✅")
-        lines.append(f"{st} `{code}` | {days}d | {f'`{cb}`' if cb else '—'} | {exp.split('T')[0]}")
-        if active and now_utc() <= parse_iso(exp):
-            buttons.append([Button.inline(f"🚫 Revoke {code}", f"rev_{code}".encode())])
-    await event.reply("\n".join(lines), buttons=buttons or None)
+    await event.reply("🚫 `" + code + "` revoked.", buttons=admin_kb())
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/numbers", "📱 All Numbers"]))
 async def cmd_numbers(event):
     if not is_admin(event.sender_id): return
     rows = c.execute("SELECT ua.phone,ua.user_id,u.username,ua.added_at FROM user_accounts ua LEFT JOIN users u ON ua.user_id=u.user_id ORDER BY ua.added_at DESC").fetchall()
     if not rows: await event.reply("Koi number nahi.", buttons=admin_kb()); return
-    lines = [f"📱 **All Numbers** ({len(rows)})\n"]
+    lines2 = ["📱 **All Numbers** (" + str(len(rows)) + ")\n"]
     buttons = []
     for phone, uid2, uname, added in rows:
-        name = f"@{uname}" if uname else f"ID:{uid2}"
-        lines.append(f"• `{phone}` — {name}  /removenum {phone}")
-        buttons.append([Button.inline(f"🗑 {phone}", f"rmnum_{phone}".encode())])
-    await event.reply("\n".join(lines), buttons=buttons)
+        name = "@" + uname if uname else "ID:" + str(uid2)
+        lines2.append("• `" + phone + "` — " + name + "  /removenum " + phone)
+        buttons.append([Button.inline("🗑 " + phone, ("rmnum_" + phone).encode())])
+    await event.reply("\n".join(lines2), buttons=buttons)
 
 @bot.on(events.NewMessage(pattern=r"^/removenum\s+(\+\d+)$"))
 async def cmd_removenum(event):
     if not is_admin(event.sender_id): return
     phone = event.pattern_match.group(1).strip()
     await db_write("DELETE FROM user_accounts WHERE phone=?", (phone,))
-    await event.reply(f"🗑 `{phone}` removed.", buttons=admin_kb())
+    await event.reply("🗑 `" + phone + "` removed.", buttons=admin_kb())
+
+@bot.on(events.NewMessage(pattern=r"^/endtrial\s+(\d+)$"))
+async def cmd_endtrial(event):
+    if not is_admin(event.sender_id): return
+    uid = int(event.pattern_match.group(1))
+    row = c.execute("SELECT user_id,username,trial_granted FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row: await event.reply("❌ User nahi mila."); return
+    if not row[2]: await event.reply("⚠️ Is user ka trial tha hi nahi."); return
+    await db_write("UPDATE users SET trial_expires=?,trial_granted=0 WHERE user_id=?", (now_iso(), uid))
+    name = "@" + row[1] if row[1] else "`" + str(uid) + "`"
+    await event.reply("✅ **" + name + " ka Trial Khatam!**", buttons=admin_kb())
+    try:
+        await bot.send_message(uid, "⚠️ **Tumhara Trial Khatam Ho Gaya**\n\nAdmin ne trial end kar diya.\nAccess ke liye /redeem CODE karo.")
+    except Exception: pass
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/tasks", "⏰ All Tasks"]))
 async def cmd_tasks(event):
     if not is_admin(event.sender_id): return
     rows = c.execute("SELECT st.id,st.user_id,u.username,st.phone,st.interval_seconds,st.is_active,st.fail_count,st.messages_json FROM scheduled_tasks st LEFT JOIN users u ON st.user_id=u.user_id ORDER BY st.id DESC").fetchall()
     if not rows: await event.reply("Koi task nahi.", buttons=admin_kb()); return
-    lines = [f"⏰ **All Tasks** ({len(rows)})\n"]
+    lines2  = ["⏰ **All Tasks** (" + str(len(rows)) + ")\n"]
     buttons = []
     for tid, uid2, uname, phone, iv, act2, fails, mj in rows:
-        name = f"@{uname}" if uname else f"ID:{uid2}"
+        name = "@" + uname if uname else "ID:" + str(uid2)
         nm   = len(msgs_list(mj))
-        lines.append(f"{'▶️' if act2 else '⏹'} **#{tid}** {name} | `{phone}` | {fmt_mins(iv)} | {nm}msg")
-        if act2: buttons.append([Button.inline(f"🛑 Stop #{tid}", f"ast_{tid}".encode())])
-    await event.reply("\n".join(lines), buttons=buttons or None)
+        lines2.append(("▶️" if act2 else "⏹") + " **#" + str(tid) + "** " + name + " | `" + phone + "` | " + fmt_mins(iv) + " | " + str(nm) + "msg")
+        if act2: buttons.append([Button.inline("🛑 Stop #" + str(tid), ("ast_" + str(tid)).encode())])
+        else:    buttons.append([Button.inline("▶️ Start #" + str(tid), ("astart_" + str(tid)).encode())])
+    await event.reply("\n".join(lines2), buttons=buttons or None)
 
 @bot.on(events.NewMessage(pattern=r"^/adminstarttask\s+(\d+)$"))
 async def cmd_adminstarttask(event):
@@ -959,25 +1307,6 @@ async def cmd_adminstoptask(event):
     if tid in scheduler_tasks: scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
     await event.reply("🛑 Task #" + str(tid) + " stopped.", buttons=admin_kb())
 
-@bot.on(events.NewMessage(pattern=r"^/endtrial\s+(\d+)$"))
-async def cmd_endtrial(event):
-    if not is_admin(event.sender_id): return
-    uid = int(event.pattern_match.group(1))
-    row = c.execute("SELECT user_id,username,trial_granted,trial_expires FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row: await event.reply("❌ User nahi mila."); return
-    if not row[2]: await event.reply("⚠️ Is user ka trial tha hi nahi."); return
-    await db_write("UPDATE users SET trial_expires=?,trial_granted=0 WHERE user_id=?",
-        (now_iso(), uid))
-    name = "@" + row[1] if row[1] else "`" + str(uid) + "`"
-    await event.reply("✅ **" + name + " ka Trial Khatam Kar Diya!**\n\nAb woh /redeem se code lega.", buttons=admin_kb())
-    try:
-        await bot.send_message(uid,
-            "⚠️ **Tumhara Trial Khatam Ho Gaya**\n\n"
-            "Admin ne tumhara trial end kar diya.\n"
-            "Access ke liye /redeem CODE karo."
-        )
-    except Exception: pass
-
 @bot.on(events.NewMessage(pattern=r"^/admindeltask\s+(\d+)$"))
 async def cmd_admindeltask(event):
     if not is_admin(event.sender_id): return
@@ -985,7 +1314,22 @@ async def cmd_admindeltask(event):
     await db_write("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,))
     if tid in scheduler_tasks: scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
     await db_write("DELETE FROM scheduled_tasks WHERE id=?", (tid,))
-    await event.reply(f"🗑 Task #{tid} deleted.", buttons=admin_kb())
+    await event.reply("🗑 Task #" + str(tid) + " deleted.", buttons=admin_kb())
+
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"astart_")))
+async def cb_astart(event):
+    if not is_admin(event.sender_id): return
+    tid = int(event.data.decode().replace("astart_", ""))
+    row = c.execute("SELECT user_id,phone,interval_seconds FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
+    if not row: await event.answer("Task nahi mila.", alert=True); return
+    uid2, phone, iv = row
+    sess_row = c.execute("SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid2, phone)).fetchone()
+    if not sess_row: await event.answer("Session nahi mila.", alert=True); return
+    await db_write("UPDATE scheduled_tasks SET is_active=1,fail_count=0 WHERE id=?", (tid,))
+    if tid not in scheduler_tasks:
+        start_task(tid, uid2, phone, sess_row[0], iv)
+    await event.answer("▶️ Started!")
+    await event.edit("▶️ **Task #" + str(tid) + " started!**")
 
 @bot.on(events.NewMessage(pattern=r"^/usergroups\s+(\d+)$"))
 async def cmd_usergroups(event):
@@ -993,24 +1337,24 @@ async def cmd_usergroups(event):
     uid = int(event.pattern_match.group(1))
     msg = await event.reply("🔍 Fetching...")
     accounts = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
-    urow     = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
-    name     = f"@{urow[0]}" if urow and urow[0] else f"ID:{uid}"
-    if not accounts: await msg.edit(f"📊 {name} ke koi accounts nahi."); return
-    lines = [f"📊 **{name} ke Groups**\n"]
+    urow = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+    name = "@" + urow[0] if urow and urow[0] else "ID:" + str(uid)
+    if not accounts: await msg.edit("📊 " + name + " ke koi accounts nahi."); return
+    lines2 = ["📊 **" + name + " ke Groups**\n"]
     for phone, sess in accounts:
         cl = await open_client(phone, sess)
-        if not cl: lines.append(f"\n📵 `{phone}`: fail"); continue
+        if not cl: lines2.append("\n📵 `" + phone + "`: fail"); continue
         try:
-            dlgs   = await cl.get_dialogs(limit=None)
-            groups = [d for d in dlgs if d.is_group or d.is_channel]
-            lines.append(f"\n📱 `{phone}` — {len(groups)} groups:")
-            for g in groups:
+            dlgs = await cl.get_dialogs(limit=None)
+            grps = [d for d in dlgs if d.is_group or d.is_channel]
+            lines2.append("\n📱 `" + phone + "` — " + str(len(grps)) + ":")
+            for g in grps:
                 icon  = "📣" if g.is_channel else "👥"
-                uname = f"@{g.entity.username}" if getattr(g.entity, 'username', None) else "🔒 private"
-                lines.append(f"  {icon} {g.name}  |  {uname}")
-        except Exception as e: lines.append(f"\n⚠️ `{phone}`: {e}")
+                uname2 = "@" + g.entity.username if getattr(g.entity, "username", None) else "🔒 private"
+                lines2.append("  " + icon + " " + g.name + "  |  " + uname2)
+        except Exception as e: lines2.append("\n⚠️ `" + phone + "`: " + str(e))
         finally: await close(cl)
-    await msg.edit("\n".join(lines)[:4000])
+    await msg.edit("\n".join(lines2)[:4000])
 
 @bot.on(events.NewMessage(pattern=r"^/sendmsg\s+(\d+)\s+(.+)$"))
 async def cmd_sendmsg(event):
@@ -1018,10 +1362,10 @@ async def cmd_sendmsg(event):
     target = int(event.pattern_match.group(1))
     text   = event.pattern_match.group(2).strip()
     try:
-        await bot.send_message(target, f"📨 **Admin ka message:**\n\n{text}")
-        await event.reply(f"✅ Sent to `{target}`.", buttons=admin_kb())
+        await bot.send_message(target, "📨 **Admin message:**\n\n" + text)
+        await event.reply("✅ Sent to `" + str(target) + "`.", buttons=admin_kb())
     except Exception as e:
-        await event.reply(f"❌ Failed: {e}", buttons=admin_kb())
+        await event.reply("❌ Failed: " + str(e), buttons=admin_kb())
 
 @bot.on(events.NewMessage(func=lambda e: e.text and (e.text.strip() == "📢 Broadcast" or e.text.strip().startswith("/broadcast"))))
 async def cmd_broadcast(event):
@@ -1032,19 +1376,19 @@ async def cmd_broadcast(event):
         pending[event.sender_id] = {"action": "admin_broadcast"}
         await event.reply("📢 Message type karo:", buttons=[[Button.text("❌ Cancel")]]); return
     m = re.match(r"^/broadcast\s+(.+)$", text, re.DOTALL)
-    if not m: await event.reply("Usage: /broadcast text here"); return
+    if not m: await event.reply("Usage: /broadcast text"); return
     await _do_broadcast(event, m.group(1).strip())
 
 async def _do_broadcast(ctx, text):
     users = c.execute("SELECT user_id FROM users WHERE is_banned=0").fetchall()
-    prog  = await ctx.reply(f"📢 Sending to {len(users)} users...")
-    sent  = 0; failed = 0
+    prog  = await ctx.reply("📢 Sending to " + str(len(users)) + " users...")
+    sent = 0; failed = 0
     for (uid2,) in users:
         try:
-            await bot.send_message(uid2, f"📢 **Admin ka message:**\n\n{text}")
+            await bot.send_message(uid2, "📢 **Admin message:**\n\n" + text)
             sent += 1; await asyncio.sleep(0.3)
         except Exception: failed += 1
-    await prog.edit(f"📢 **Done!** ✅ Sent: {sent} | ❌ Failed: {failed}", buttons=admin_kb())
+    await prog.edit("📢 **Done!** ✅ " + str(sent) + " | ❌ " + str(failed), buttons=admin_kb())
 
 # ─────────────────────────── BUTTON HANDLERS ─────────────────
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "➕ Add Account"))
@@ -1459,6 +1803,15 @@ async def _do_redeem(ctx, uid, code):
     if now_utc() > parse_iso(expires): await ctx.reply("⚠️ Code expire ho gaya."); return
     if not claimed_by:
         await db_write("UPDATE access_codes SET claimed_by=?,claimed_at=? WHERE code=?", (uid, now_iso(), code))
+        # Log claim
+        _urow4 = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
+        _un4   = _urow4[0] if _urow4 and _urow4[0] else ""
+        _creator = c.execute("SELECT created_by FROM access_codes WHERE code=?", (code,)).fetchone()
+        _crid  = _creator[0] if _creator and _creator[0] else ADMIN_ID
+        _crow  = c.execute("SELECT username FROM users WHERE user_id=?", (_crid,)).fetchone()
+        _cname = _crow[0] if _crow and _crow[0] else str(_crid)
+        await log_event("code_claimed", _crid, "@" + _cname if _cname else str(_crid), code,
+            "Claimed by " + ("@" + _un4 if _un4 else str(uid)) + " | " + str(days) + " days")
     await ctx.reply(
         f"🎉 **Access Activate Ho Gaya!**\n\n🔑 Code: `{code}`\n📅 {days} din\n⏳ {expires.split('T')[0]}",
         buttons=main_kb()
