@@ -91,6 +91,12 @@ except Exception: pass
 try:
     c.execute("ALTER TABLE access_codes ADD COLUMN created_by INTEGER DEFAULT NULL")
 except Exception: pass
+try:
+    c.execute("ALTER TABLE scheduled_tasks ADD COLUMN msg_ids_json TEXT DEFAULT '[]'")
+except Exception: pass
+try:
+    c.execute("ALTER TABLE scheduled_tasks ADD COLUMN source_chat_id INTEGER DEFAULT NULL")
+except Exception: pass
 conn.commit()
 
 # ─────────────────────────── GLOBALS ─────────────────────────
@@ -254,14 +260,33 @@ async def run_task(task_id, uid, phone, sess, interval):
                 dialogs = await cl.get_dialogs(limit=None)
                 groups  = [d for d in dialogs if d.is_group or d.is_channel]
                 sent    = 0
+
+                # Get msg_ids and source_chat for exact forwarding
+                task_row2 = c.execute(
+                    "SELECT msg_ids_json, source_chat_id FROM scheduled_tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                msg_ids_all  = json.loads(task_row2[0] or "[]") if task_row2 else []
+                source_chat  = task_row2[1] if task_row2 else None
+                fwd_msg_id   = msg_ids_all[idx % len(msg_ids_all)] if msg_ids_all else None
+
                 for g in groups:
                     try:
-                        await cl.send_message(g.entity, msg)
+                        if fwd_msg_id and source_chat:
+                            # Exact forward — same format, no change
+                            await cl.forward_messages(g.entity, fwd_msg_id, source_chat)
+                        else:
+                            # Plain text fallback
+                            await cl.send_message(g.entity, msg)
                         sent += 1
                         await asyncio.sleep(1)
                     except FloodWaitError as fw:
                         await asyncio.sleep(fw.seconds + 5)
-                    except Exception: pass
+                    except Exception:
+                        # Fallback to text if forward fails
+                        try:
+                            await cl.send_message(g.entity, msg)
+                            sent += 1
+                        except Exception: pass
                 await close(cl)
                 await db_write(
                     "UPDATE scheduled_tasks SET fail_count=0,current_msg_idx=?,next_run=? WHERE id=?",
@@ -511,9 +536,9 @@ async def cmd_cancel(event):
         cl = pending[uid].get("client")
         if cl: await close(cl)
         del pending[uid]
-        await event.reply("✅ Cancel ho gaya.", buttons=main_kb())
+        await event.reply("✅ Cancel ho gaya.", buttons=main_kb(), parse_mode='md')
     else:
-        await event.reply("Kuch cancel nahi tha.", buttons=main_kb())
+        await event.reply("Kuch cancel nahi tha.", buttons=main_kb(), parse_mode='md')
 
 # ─────────────────────────── /myid ───────────────────────────
 @bot.on(events.NewMessage(pattern=r"^/myid$"))
@@ -536,7 +561,7 @@ async def cmd_status(event):
         row = c.execute("SELECT expires_at FROM access_codes WHERE code=?", (tag,)).fetchone()
         await event.reply(f"✅ **Status: Active**\nCode: `{tag}`\nExpiry: {(row[0] or '?').split('T')[0]}")
     else:
-        await event.reply("❌ **Status: No Access**\n/redeem CODE karo.")
+        await event.reply("❌ **Status: No Access**\n/redeem CODE karo.", parse_mode='md')
 
 # ─────────────────────────── /redeem ─────────────────────────
 @bot.on(events.NewMessage(pattern=r"^/redeem\s+(\S+)$"))
@@ -621,7 +646,7 @@ async def cmd_schedule(event):
     if not c.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id=?", (uid,)).fetchone()[0]:
         await event.reply("❌ Koi account nahi. /addsession karo."); return
     pending[uid] = {"action": "await_msg", "mode": "schedule", "messages": []}
-    await event.reply("📝 **Message #1 type karo** (ya forward karo):\n\nMultiple messages add kar sakte ho.\n/cancel se wapas.")
+    await event.reply("📝 **Message #1 type karo** (ya forward karo):\n\nMultiple messages add kar sakte ho.\n/cancel se wapas.", parse_mode='md')
 
 # ─────────────────────────── /myschedules ────────────────────
 @bot.on(events.NewMessage(pattern=r"^/myschedules$"))
@@ -643,7 +668,7 @@ async def cmd_starttask(event):
     await db_write("UPDATE scheduled_tasks SET is_active=1,fail_count=0 WHERE id=?", (tid,))
     if tid not in scheduler_tasks:
         start_task(tid, uid, phone, sess_row[0], iv)
-    await event.reply("▶️ **Task #" + str(tid) + " Start Ho Gaya!**", buttons=main_kb())
+    await event.reply("▶️ **Task #" + str(tid) + " Start Ho Gaya!**", buttons=main_kb(), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/stoptask\s+(\d+)$"))
 async def cmd_stoptask(event):
@@ -704,7 +729,7 @@ async def cmd_settings(event):
             f"    /stoptask {tid}  /deltask {tid}"
         )
     if not tasks: lines.append("  Koi nahi — /schedule")
-    await event.reply("\n".join(lines), buttons=main_kb())
+    await event.reply("\n".join(lines), buttons=main_kb(), parse_mode='md')
 
 # ─────────────────────────── ADMIN COMMANDS ──────────────────
 @bot.on(events.NewMessage(pattern=r"^/addadmin\s+(\d+)$"))
@@ -779,7 +804,7 @@ async def cmd_buy(event):
                 lines.append("  • `" + str(uid2) + "`")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("💡 _Admin ko DM karo aur best deal pao!_")
-    await event.reply("\n".join(lines))
+    await event.reply("\n".join(lines), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/removeadmin\s+(\d+)$"))
 async def cmd_removeadmin(event):
@@ -817,11 +842,11 @@ async def cmd_admins_list(event):
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/admin", "🔧 Admin Panel"]))
 async def cmd_admin(event):
     if not is_admin(event.sender_id): return
-    await event.reply("👑 **Admin Panel**", buttons=admin_kb(event.sender_id))
+    await event.reply("👑 **Admin Panel**", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["👤 User Menu", "🔙 User Menu"]))
 async def cmd_usermenu(event):
-    await event.reply("👤 **User Menu**", buttons=main_kb())
+    await event.reply("👤 **User Menu**", buttons=main_kb(), parse_mode='md')
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/stats", "📊 Stats"]))
 async def cmd_stats(event):
@@ -894,7 +919,7 @@ async def cmd_logs(event):
             "   📝 " + (details or "—") + "\n"
             "   🕐 " + date
         )
-    await event.reply("\n\n".join(lines)[:4000], buttons=admin_kb(event.sender_id))
+    await event.reply("\n\n".join(lines)[:4000], buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/adminstats$"))
 async def cmd_adminstats(event):
@@ -961,7 +986,7 @@ async def cmd_users(event):
             Button.inline("🚫 Ban",           f"uban_{uid2}".encode()),
             Button.inline("🗑 Del",           f"udelc_{uid2}".encode()),
         ])
-    await event.reply("\n".join(lines), buttons=buttons)
+    await event.reply("\n".join(lines), buttons=buttons, parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/userinfo\s+(\d+)$"))
 async def cmd_userinfo(event):
@@ -1153,7 +1178,7 @@ async def cmd_pending(event):
         Button.inline("✅ Approve ALL", b"creq_all_ok"),
         Button.inline("❌ Reject ALL",  b"creq_all_no"),
     ])
-    await event.reply("\n\n".join(lines2), buttons=buttons)
+    await event.reply("\n\n".join(lines2), buttons=buttons, parse_mode='md')
 
 # Approve ALL
 @bot.on(events.CallbackQuery(data=b"creq_all_ok"))
@@ -1178,7 +1203,7 @@ async def cb_creq_all_ok(event):
             )
         except Exception: pass
         done += 1
-    await event.edit("✅ **" + str(done) + " requests approve ho gayi!**", buttons=admin_kb(event.sender_id))
+    await event.edit("✅ **" + str(done) + " requests approve ho gayi!**", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 # Reject ALL
 @bot.on(events.CallbackQuery(data=b"creq_all_no"))
@@ -1191,7 +1216,7 @@ async def cb_creq_all_no(event):
         try:
             await bot.send_message(requester, "❌ **Code Request Reject Ho Gayi.**\nOwner ne approve nahi kiya.")
         except Exception: pass
-    await event.edit("❌ **" + str(len(rows)) + " requests reject ho gayi.**", buttons=admin_kb(event.sender_id))
+    await event.edit("❌ **" + str(len(rows)) + " requests reject ho gayi.**", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 # Approve callback
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"creq_ok_")))
@@ -1243,7 +1268,7 @@ async def cb_creq_no(event):
     _un3   = _urow3[0] if _urow3 and _urow3[0] else ""
     await log_event("code_rejected", ADMIN_ID, "Owner", "", "Rejected request from " + ("@" + _un3 if _un3 else str(requester)) + " | " + str(days) + " days")
     remaining = c.execute("SELECT COUNT(*) FROM code_requests WHERE status='pending'").fetchone()[0]
-    await event.edit("❌ **Rejected.**\n\n📋 Remaining pending: " + str(remaining))
+    await event.edit("❌ **Rejected.**\n\n📋 Remaining pending: " + str(remaining), parse_mode='md')
     try:
         await bot.send_message(requester, "❌ **Code Request Reject Ho Gayi.**\nOwner ne approve nahi kiya.")
     except Exception: pass
@@ -1408,20 +1433,20 @@ async def _do_extend(ctx, target_uid, days, admin_uid=None):
     if row:
         new_exp = (parse_iso(row[1]) + timedelta(days=days)).isoformat()
         await db_write("UPDATE access_codes SET expires_at=?,days_valid=days_valid+? WHERE code=?", (new_exp, days, row[0]))
-        await ctx.reply("✅ `" + str(target_uid) + "` +" + str(days) + " din. Expiry: " + new_exp.split("T")[0], buttons=admin_kb(admin_uid))
+        await ctx.reply("✅ `" + str(target_uid) + "` +" + str(days) + " din. Expiry: " + new_exp.split("T")[0], buttons=admin_kb(admin_uid), parse_mode='md')
     else:
         code    = gen_code()
         expires = (now_utc() + timedelta(days=days)).isoformat()
         await db_write("INSERT INTO access_codes(code,days_valid,created_at,claimed_by,claimed_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?)",
             (code, days, now_iso(), target_uid, now_iso(), expires, admin_uid))
-        await ctx.reply("✅ Code `" + code + "` given to `" + str(target_uid) + "`. Expiry: " + expires.split("T")[0], buttons=admin_kb(admin_uid))
+        await ctx.reply("✅ Code `" + code + "` given to `" + str(target_uid) + "`. Expiry: " + expires.split("T")[0], buttons=admin_kb(admin_uid), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/revoke\s+(\S+)$"))
 async def cmd_revoke(event):
     if not is_admin(event.sender_id): return
     code = event.pattern_match.group(1).upper()
     await db_write("UPDATE access_codes SET is_active=0 WHERE code=?", (code,))
-    await event.reply("🚫 `" + code + "` revoked.", buttons=admin_kb(event.sender_id))
+    await event.reply("🚫 `" + code + "` revoked.", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() in ["/numbers", "📱 All Numbers"]))
 async def cmd_numbers(event):
@@ -1434,14 +1459,14 @@ async def cmd_numbers(event):
         name = "@" + uname if uname else "ID:" + str(uid2)
         lines2.append("• `" + phone + "` — " + name + "  /removenum " + phone)
         buttons.append([Button.inline("🗑 " + phone, ("rmnum_" + phone).encode())])
-    await event.reply("\n".join(lines2), buttons=buttons)
+    await event.reply("\n".join(lines2), buttons=buttons, parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/removenum\s+(\+\d+)$"))
 async def cmd_removenum(event):
     if not is_admin(event.sender_id): return
     phone = event.pattern_match.group(1).strip()
     await db_write("DELETE FROM user_accounts WHERE phone=?", (phone,))
-    await event.reply("🗑 `" + phone + "` removed.", buttons=admin_kb(event.sender_id))
+    await event.reply("🗑 `" + phone + "` removed.", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/endtrial\s+(\d+)$"))
 async def cmd_endtrial(event):
@@ -1452,7 +1477,7 @@ async def cmd_endtrial(event):
     if not row[2]: await event.reply("⚠️ Is user ka trial tha hi nahi."); return
     await db_write("UPDATE users SET trial_expires=?,trial_granted=0 WHERE user_id=?", (now_iso(), uid))
     name = "@" + row[1] if row[1] else "`" + str(uid) + "`"
-    await event.reply("✅ **" + name + " ka Trial Khatam!**", buttons=admin_kb(event.sender_id))
+    await event.reply("✅ **" + name + " ka Trial Khatam!**", buttons=admin_kb(event.sender_id), parse_mode='md')
     try:
         await bot.send_message(uid, "⚠️ **Tumhara Trial Khatam Ho Gaya**\n\nAdmin ne trial end kar diya.\nAccess ke liye /redeem CODE karo.")
     except Exception: pass
@@ -1470,7 +1495,7 @@ async def cmd_tasks(event):
         lines2.append(("▶️" if act2 else "⏹") + " **#" + str(tid) + "** " + name + " | `" + phone + "` | " + fmt_mins(iv) + " | " + str(nm) + "msg")
         if act2: buttons.append([Button.inline("🛑 Stop #" + str(tid), ("ast_" + str(tid)).encode())])
         else:    buttons.append([Button.inline("▶️ Start #" + str(tid), ("astart_" + str(tid)).encode())])
-    await event.reply("\n".join(lines2), buttons=buttons or None)
+    await event.reply("\n".join(lines2), buttons=buttons or None, parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/adminstarttask\s+(\d+)$"))
 async def cmd_adminstarttask(event):
@@ -1485,7 +1510,7 @@ async def cmd_adminstarttask(event):
     await db_write("UPDATE scheduled_tasks SET is_active=1,fail_count=0 WHERE id=?", (tid,))
     if tid not in scheduler_tasks:
         start_task(tid, uid2, phone, sess_row[0], iv)
-    await event.reply("▶️ **Task #" + str(tid) + " Started!**", buttons=admin_kb(event.sender_id))
+    await event.reply("▶️ **Task #" + str(tid) + " Started!**", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/adminstoptask\s+(\d+)$"))
 async def cmd_adminstoptask(event):
@@ -1493,7 +1518,7 @@ async def cmd_adminstoptask(event):
     tid = int(event.pattern_match.group(1))
     await db_write("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,))
     if tid in scheduler_tasks: scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
-    await event.reply("🛑 Task #" + str(tid) + " stopped.", buttons=admin_kb(event.sender_id))
+    await event.reply("🛑 Task #" + str(tid) + " stopped.", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/admindeltask\s+(\d+)$"))
 async def cmd_admindeltask(event):
@@ -1502,7 +1527,7 @@ async def cmd_admindeltask(event):
     await db_write("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,))
     if tid in scheduler_tasks: scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
     await db_write("DELETE FROM scheduled_tasks WHERE id=?", (tid,))
-    await event.reply("🗑 Task #" + str(tid) + " deleted.", buttons=admin_kb(event.sender_id))
+    await event.reply("🗑 Task #" + str(tid) + " deleted.", buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"astart_")))
 async def cb_astart(event):
@@ -1517,7 +1542,7 @@ async def cb_astart(event):
     if tid not in scheduler_tasks:
         start_task(tid, uid2, phone, sess_row[0], iv)
     await event.answer("▶️ Started!")
-    await event.edit("▶️ **Task #" + str(tid) + " started!**")
+    await event.edit("▶️ **Task #" + str(tid) + " started!**", parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/usergroups\s+(\d+)$"))
 async def cmd_usergroups(event):
@@ -1542,7 +1567,7 @@ async def cmd_usergroups(event):
                 lines2.append("  " + icon + " " + g.name + "  |  " + uname2)
         except Exception as e: lines2.append("\n⚠️ `" + phone + "`: " + str(e))
         finally: await close(cl)
-    await msg.edit("\n".join(lines2)[:4000])
+    await msg.edit("\n".join(lines2)[:4000], parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/sendmsg\s+(\d+)\s+(.+)$"))
 async def cmd_sendmsg(event):
@@ -1551,9 +1576,9 @@ async def cmd_sendmsg(event):
     text   = event.pattern_match.group(2).strip()
     try:
         await bot.send_message(target, "📨 **Admin message:**\n\n" + text)
-        await event.reply("✅ Sent to `" + str(target) + "`.", buttons=admin_kb(event.sender_id))
+        await event.reply("✅ Sent to `" + str(target) + "`.", buttons=admin_kb(event.sender_id), parse_mode='md')
     except Exception as e:
-        await event.reply("❌ Failed: " + str(e), buttons=admin_kb(event.sender_id))
+        await event.reply("❌ Failed: " + str(e), buttons=admin_kb(event.sender_id), parse_mode='md')
 
 @bot.on(events.NewMessage(func=lambda e: e.text and (e.text.strip() == "📢 Broadcast" or e.text.strip().startswith("/broadcast"))))
 async def cmd_broadcast(event):
@@ -1577,7 +1602,7 @@ async def _do_broadcast(ctx, text):
             sent += 1; await asyncio.sleep(0.3)
         except Exception: failed += 1
     bcast_uid = getattr(ctx, 'sender_id', ADMIN_ID) or ADMIN_ID
-    await prog.edit("📢 **Done!** ✅ " + str(sent) + " | ❌ " + str(failed), buttons=admin_kb(bcast_uid))
+    await prog.edit("📢 **Done!** ✅ " + str(sent) + " | ❌ " + str(failed), buttons=admin_kb(bcast_uid), parse_mode='md')
 
 # ─────────────────────────── BUTTON HANDLERS ─────────────────
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "➕ Add Account"))
@@ -1597,7 +1622,7 @@ async def btn_sendnow(event):
     if not c.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id=?", (uid,)).fetchone()[0]:
         await event.reply("❌ Account nahi. /addsession karo."); return
     pending[uid] = {"action": "await_msg", "mode": "send_now"}
-    await event.reply("✏️ Message type karo (ya forward karo):\n/cancel se wapas.")
+    await event.reply("✏️ Message type karo (ya forward karo):\n/cancel se wapas.", parse_mode='md')
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "📋 My Schedules"))
 async def btn_scheds(event): await _show_schedules(event, event.sender_id, edit=False)
@@ -1606,7 +1631,7 @@ async def btn_scheds(event): await _show_schedules(event, event.sender_id, edit=
 async def btn_redeem(event):
     uid = event.sender_id
     pending[uid] = {"action": "await_redeem_code"}
-    await event.reply("🔑 Code type karo:\n/cancel se wapas.", buttons=[[Button.text("❌ Cancel")]])
+    await event.reply("🔑 Code type karo:\n/cancel se wapas.", buttons=[[Button.text("❌ Cancel")]], parse_mode='md')
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "💬 Buy Access"))
 async def btn_buy(event):
@@ -1624,32 +1649,62 @@ async def btn_cancel(event):
         cl = pending[uid].get("client")
         if cl: await close(cl)
         del pending[uid]
-    await event.reply("✅ Cancel ho gaya.", buttons=main_kb())
+    await event.reply("✅ Cancel ho gaya.", buttons=main_kb(), parse_mode='md')
 
 # ─────────────────────────── FORWARD ─────────────────────────
 @bot.on(events.NewMessage(func=lambda e: e.message and e.message.fwd_from is not None))
 async def on_forward(event):
     uid   = event.sender_id
     ok, _ = await check_access(uid)
-    if not ok: await event.reply("❌ Access nahi."); return
-    text  = event.message.message or "[Forwarded media]"
-    st    = pending.get(uid, {})
+    if not ok: await event.reply("❌ Access nahi.", parse_mode='md'); return
+
+    # Store BOTH text and original message info for exact forwarding
+    text    = event.message.message or "[Media/Forward]"
+    msg_id  = event.message.id
+    chat_id = event.chat_id
+
+    st = pending.get(uid, {})
     if st.get("action") == "await_msg" and st.get("mode") == "schedule":
-        msgs = st.setdefault("messages", [])
+        msgs     = st.setdefault("messages", [])
+        msg_ids  = st.setdefault("msg_ids", [])
+        src_chat = st.get("source_chat_id") or chat_id
         msgs.append(text)
+        msg_ids.append(msg_id)
+        st["source_chat_id"] = src_chat
         await event.reply(
-            f"📩 **Message #{len(msgs)} added!**\n`{text[:100]}`",
+            f"📩 **Message #{len(msgs)} added!** (Exact format save hua)\n`{text[:80]}`",
             buttons=[
                 [Button.inline(f"➕ Add #{len(msgs)+1}", b"add_msg")],
                 [Button.inline("▶️ Continue",           b"msgs_done")],
                 [Button.inline("❌ Cancel",             b"cx")],
-            ]
+            ], parse_mode='md'
+        )
+    elif st.get("action") == "tedit_msg":
+        # Forward as exact edit for scheduled task
+        tid = st["tid"]
+        del pending[uid]
+        await db_write(
+            "UPDATE scheduled_tasks SET messages_json=?, msg_ids_json=?, source_chat_id=? WHERE id=?",
+            (json.dumps([text]), json.dumps([msg_id]), chat_id, tid)
+        )
+        if tid in scheduler_tasks:
+            scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
+        row_e = c.execute("SELECT phone, interval_seconds, is_active FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
+        if row_e and row_e[2]:
+            sess_e = c.execute("SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid, row_e[0])).fetchone()
+            if sess_e: start_task(tid, uid, row_e[0], sess_e[0], row_e[1])
+        await event.reply(
+            f"✅ **Task #{tid} ka message update ho gaya!** (Exact format saved)\n`{text[:80]}`",
+            buttons=main_kb(), parse_mode='md'
         )
     else:
-        pending[uid] = {"action": "msg_ready", "text": text}
+        pending[uid] = {
+            "action": "msg_ready", "text": text,
+            "msg_id": msg_id, "source_chat_id": chat_id
+        }
         await event.reply(
-            f"📩 **Forward detect hua!**\n`{text[:200]}`\n\nKya karna hai?",
-            buttons=action_btns()
+            f"📩 **Forward detect hua!**\n`{text[:100]}`\n\nKya karna hai?",
+            buttons=action_btns(), parse_mode='md'
         )
 
 # ─────────────────────────── CALLBACKS ───────────────────────
@@ -1660,7 +1715,7 @@ async def cb_cx(event):
         cl = pending[uid].get("client")
         if cl: await close(cl)
         del pending[uid]
-    await event.edit("❌ Cancel ho gaya.")
+    await event.edit("❌ Cancel ho gaya.", parse_mode='md')
 
 @bot.on(events.CallbackQuery(data=b"noop"))
 async def cb_noop(event): await event.answer()
@@ -1673,7 +1728,7 @@ async def cb_do_send_now(event):
     text     = pending.pop(uid)["text"]
     accounts = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
     if not accounts: await event.edit("❌ Koi account nahi."); return
-    await event.edit("📤 Sending...")
+    await event.edit("📤 Sending...", parse_mode='md')
     await _send_now_core(event, uid, text, accounts)
 
 @bot.on(events.CallbackQuery(data=b"do_schedule"))
@@ -1754,7 +1809,7 @@ async def cb_iv_custom(event):
     uid = event.sender_id
     if uid not in pending: await event.answer("Session expire.", alert=True); return
     pending[uid]["action"] = "schedule_custom_iv"
-    await event.edit("✏️ **Kitne minutes?** Type karo:\nExamples: `5` `42` `200` (minimum 1)")
+    await event.edit("✏️ **Kitne minutes?** Type karo:\nExamples: `5` `42` `200` (minimum 1)", parse_mode='md')
 
 async def _create_task_cb(event, uid, iv_sec):
     data  = pending.pop(uid)
@@ -1789,7 +1844,7 @@ async def cb_uinfo(event):
 async def cb_ugrp(event):
     if not is_admin(event.sender_id): return
     uid  = int(event.data.decode().replace("ugrp_", ""))
-    await event.edit("🔍 Fetching groups...")
+    await event.edit("🔍 Fetching groups...", parse_mode='md')
     accounts = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchall()
     urow = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
     name = f"@{urow[0]}" if urow and urow[0] else f"ID:{uid}"
@@ -1808,7 +1863,7 @@ async def cb_ugrp(event):
                 lines.append(f"  {icon} {g.name}  |  {uname}")
         except Exception as e: lines.append(f"\n⚠️ `{phone}`: {e}")
         finally: await close(cl)
-    await event.edit("\n".join(lines)[:4000])
+    await event.edit("\n".join(lines)[:4000], parse_mode='md')
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"uext_")))
 async def cb_uext(event):
@@ -1978,7 +2033,7 @@ async def cb_tdl_all(event):
     for tid, in c.execute("SELECT id FROM scheduled_tasks WHERE user_id=?", (uid,)).fetchall():
         if tid in scheduler_tasks: scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
     await db_write("DELETE FROM scheduled_tasks WHERE user_id=?", (uid,))
-    await event.edit("🗑 Saare tasks delete ho gaye!")
+    await event.edit("🗑 Saare tasks delete ho gaye!", parse_mode='md')
 
 @bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"tms_")))
 async def cb_tms(event):
@@ -1989,7 +2044,37 @@ async def cb_tms(event):
     msgs  = msgs_list(row[1])
     lines = [f"📝 **Task #{tid} — {len(msgs)} Messages:**\n"]
     for i, m in enumerate(msgs, 1): lines.append(f"**{i}.** `{m[:200]}`\n")
-    await event.edit("\n".join(lines)[:4000])
+    await event.edit("\n".join(lines)[:4000], parse_mode='md')
+
+# ── Edit message text ──────────────────────────────────────
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"tedit_msg_")))
+async def cb_tedit_msg(event):
+    uid = event.sender_id
+    tid = int(event.data.decode().replace("tedit_msg_", ""))
+    row = c.execute("SELECT user_id FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
+    if not row or row[0] != uid: await event.answer("❌ Tumhara nahi.", alert=True); return
+    pending[uid] = {"action": "tedit_msg", "tid": tid}
+    await event.edit(
+        f"✏️ **Task #{tid} — Naya message bhejo ya forward karo:**\n\n"
+        f"⚠️ Purana message replace ho jayega.\n/cancel se wapas.",
+        buttons=[[Button.inline("❌ Cancel", b"cx")]], parse_mode='md'
+    )
+
+# ── Edit interval time ───────────────────────────────────
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"tedit_iv_")))
+async def cb_tedit_iv(event):
+    uid = event.sender_id
+    tid = int(event.data.decode().replace("tedit_iv_", ""))
+    row = c.execute("SELECT user_id, interval_seconds FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
+    if not row or row[0] != uid: await event.answer("❌ Tumhara nahi.", alert=True); return
+    curr_mins = row[1] // 60
+    pending[uid] = {"action": "tedit_iv", "tid": tid}
+    await event.edit(
+        f"⏱ **Task #{tid} — Naya interval set karo:**\n\n"
+        f"Current: **{curr_mins} minutes**\n\n"
+        f"Naya interval minutes mein type karo (e.g. `30`):\n/cancel se wapas.",
+        buttons=[[Button.inline("❌ Cancel", b"cx")]], parse_mode='md'
+    )
 
 # ─────────────────────────── HELPERS ─────────────────────────
 async def _do_redeem(ctx, uid, code):
@@ -2063,9 +2148,13 @@ async def _show_schedules(ctx, uid, edit=False):
             row_btns.append(Button.inline(f"⏹ Stop #{tid}",  ("tsp_" + str(tid)).encode()))
         else:
             row_btns.append(Button.inline(f"▶️ Start #{tid}", ("tst_" + str(tid)).encode()))
-        row_btns.append(Button.inline(f"📝 Msgs #{tid}", ("tms_" + str(tid)).encode()))
         row_btns.append(Button.inline(f"🗑 Del #{tid}",  ("tdl_" + str(tid)).encode()))
         buttons.append(row_btns)
+        # Edit row
+        buttons.append([
+            Button.inline(f"✏️ Edit Msg #{tid}",  ("tedit_msg_" + str(tid)).encode()),
+            Button.inline(f"⏱ Edit Time #{tid}", ("tedit_iv_"  + str(tid)).encode()),
+        ])
     # Bottom row — start all / stop all / del all
     bottom = []
     if stopped_count > 0:
@@ -2201,7 +2290,7 @@ async def cmd_protectedlist(event):
         name = "@" + uname if uname else "ID:" + str(uid2)
         lines.append("  🔒 " + name + " | `" + str(uid2) + "`")
         lines.append("    /pruser " + str(uid2) + " — unprotect")
-    await event.reply("\n".join(lines), buttons=admin_kb(event.sender_id))
+    await event.reply("\n".join(lines), buttons=admin_kb(event.sender_id), parse_mode='md')
 
 # ─────────────────────────── TEXT INPUT ──────────────────────
 SKIP = {
@@ -2210,7 +2299,7 @@ SKIP = {
     "🔑 Redeem Code", "🔧 Admin Panel", "👤 User Menu", "🔙 User Menu",
     "👥 Users", "📱 All Numbers", "🔑 Codes", "⏰ All Tasks",
     "➕ Gen Code", "📊 Stats", "📢 Broadcast", "❌ Cancel",
-    "📋 My Requests", "📜 Logs", "📋 Pending", "💬 Buy Access", "🗄 Backup", "🔄 Git Sync",
+    "📋 My Requests", "📜 Logs", "📋 Pending", "💬 Buy Access", "🗄 Backup", "🔄 Git Sync", "✏️ Edit", "⏱ Time",
 }
 
 @bot.on(events.NewMessage(
@@ -2276,7 +2365,7 @@ async def on_text(event):
             await cl.connect()
             await cl.send_code_request(text)
             pending[uid] = {"action": "add_otp", "phone": text, "client": cl}
-            await event.reply("📩 OTP bheja! 5-digit code enter karo:")
+            await event.reply("📩 OTP bheja! 5-digit code enter karo:", parse_mode='md')
         except Exception as e:
             del pending[uid]; await event.reply(f"❌ Error: {e}")
 
@@ -2293,7 +2382,7 @@ async def on_text(event):
             await event.reply(f"✅ `{phone}` add ho gaya! ({cnt}/{MAX_ACCOUNTS})", buttons=main_kb())
         except SessionPasswordNeededError:
             pending[uid]["action"] = "add_2fa"
-            await event.reply("🔐 2FA password bhejo:")
+            await event.reply("🔐 2FA password bhejo:", parse_mode='md')
         except Exception as e:
             await close(cl); del pending[uid]
             await event.reply(f"❌ Login failed: {e}\n\n💡 /addsession try karo!")
@@ -2313,6 +2402,57 @@ async def on_text(event):
             await close(cl); del pending[uid]
             await event.reply(f"❌ 2FA failed: {e}")
 
+    elif act == "tedit_msg":
+        tid = pending[uid]["tid"]
+        del pending[uid]
+        # Save new message text
+        await db_write(
+            "UPDATE scheduled_tasks SET messages_json=?, msg_ids_json='[]', source_chat_id=NULL WHERE id=?",
+            (json.dumps([text]), tid)
+        )
+        # Restart task if running
+        if tid in scheduler_tasks:
+            scheduler_tasks[tid].cancel()
+            del scheduler_tasks[tid]
+        row2 = c.execute("SELECT phone, interval_seconds, is_active FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
+        if row2 and row2[2]:
+            sess_r = c.execute("SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid, row2[0])).fetchone()
+            if sess_r:
+                start_task(tid, uid, row2[0], sess_r[0], row2[1])
+        await event.reply(
+            f"✅ **Task #{tid} ka message update ho gaya!**\n\n"
+            f"📝 Naya message: `{text[:100]}`",
+            buttons=main_kb(), parse_mode='md'
+        )
+
+    elif act == "tedit_iv":
+        tid = pending[uid]["tid"]
+        try:
+            mins = int(text)
+            if mins < 1: raise ValueError
+            iv_sec = mins * 60
+            del pending[uid]
+            await db_write(
+                "UPDATE scheduled_tasks SET interval_seconds=? WHERE id=?",
+                (iv_sec, tid)
+            )
+            # Restart task with new interval
+            if tid in scheduler_tasks:
+                scheduler_tasks[tid].cancel()
+                del scheduler_tasks[tid]
+            row3 = c.execute("SELECT phone, is_active FROM scheduled_tasks WHERE id=?", (tid,)).fetchone()
+            if row3 and row3[1]:
+                sess_r2 = c.execute("SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid, row3[0])).fetchone()
+                if sess_r2:
+                    start_task(tid, uid, row3[0], sess_r2[0], iv_sec)
+            await event.reply(
+                f"✅ **Task #{tid} ka interval update ho gaya!**\n\n"
+                f"⏱ Naya interval: **{mins} minutes**",
+                buttons=main_kb(), parse_mode='md'
+            )
+        except ValueError:
+            await event.reply("❌ Sirf number bhejo (e.g. `30`)", parse_mode='md')
+
     elif act == "schedule_custom_iv":
         try:
             mins   = int(text)
@@ -2326,9 +2466,12 @@ async def on_text(event):
                 row = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchone()
                 if not row: await event.reply("❌ Koi account nahi."); return
                 phone, sess = row
+            msg_ids    = data.get("msg_ids", [])
+            source_cid = data.get("source_chat_id")
             tid = await db_write(
-                "INSERT INTO scheduled_tasks(user_id,phone,messages_json,interval_seconds,next_run) VALUES(?,?,?,?,?)",
-                (uid, phone, json.dumps(msgs), iv_sec, (now_utc() + timedelta(seconds=iv_sec)).isoformat())
+                "INSERT INTO scheduled_tasks(user_id,phone,messages_json,interval_seconds,next_run,msg_ids_json,source_chat_id) VALUES(?,?,?,?,?,?,?)",
+                (uid, phone, json.dumps(msgs), iv_sec, (now_utc() + timedelta(seconds=iv_sec)).isoformat(),
+                 json.dumps(msg_ids), source_cid)
             )
             start_task(tid, uid, phone, sess, iv_sec)
             preview = "\n".join(f"  {i+1}. `{m[:60]}`" for i, m in enumerate(msgs))
@@ -2525,9 +2668,9 @@ async def cmd_gitsync(event):
                 buttons=admin_kb(event.sender_id)
             )
     except asyncio.TimeoutError:
-        await msg.edit("⏰ Timeout! 60s se zyada laga.", buttons=admin_kb(event.sender_id))
+        await msg.edit("⏰ Timeout! 60s se zyada laga.", buttons=admin_kb(event.sender_id), parse_mode='md')
     except Exception as e:
-        await msg.edit("❌ Error: " + str(e), buttons=admin_kb(event.sender_id))
+        await msg.edit("❌ Error: " + str(e), buttons=admin_kb(event.sender_id), parse_mode='md')
 
 # /syncstatus — GitHub sync info
 @bot.on(events.NewMessage(pattern=r"^/syncstatus$"))
@@ -2584,7 +2727,7 @@ async def cmd_backup(event):
             buttons=admin_kb(event.sender_id)
         )
     else:
-        await msg.edit("❌ Backup fail!\n\nError: " + str(err), buttons=admin_kb(event.sender_id))
+        await msg.edit("❌ Backup fail!\n\nError: " + str(err), buttons=admin_kb(event.sender_id), parse_mode='md')
 
 # /restoredb MESSAGE_ID — Saved Messages se DB download + restore
 @bot.on(events.NewMessage(pattern=r"^/restoredb(?:\s+(\d+))?$"))
@@ -2616,7 +2759,7 @@ async def cmd_restoredb(event):
             lines = ["📦 **Recent Backups (Saved Messages se):**\n"]
             for mid2, stamp2, sz2 in backups:
                 lines.append(f"🗄 `{stamp2}` | {sz2} KB\n   👉 `/restoredb {mid2}`")
-            await msg.edit("\n\n".join(lines), buttons=admin_kb(event.sender_id))
+            await msg.edit("\n\n".join(lines), buttons=admin_kb(event.sender_id), parse_mode='md')
         except Exception as e:
             await msg.edit(f"❌ Error: {e}", buttons=admin_kb(event.sender_id))
         return
@@ -2638,7 +2781,7 @@ async def cmd_restoredb(event):
             import shutil
             shutil.copy2(DB_FILE, bk_path)
         
-        await msg.edit("⬇️ Downloading...")
+        await msg.edit("⬇️ Downloading...", parse_mode='md')
         # Download to temp then replace
         tmp_path = DB_FILE + ".tmp"
         await bot.download_media(tg_msg, file=tmp_path)
