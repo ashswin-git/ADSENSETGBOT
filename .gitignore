@@ -24,3 +24,4 @@ build/
 .DS_Store
 Thumbs.db
 !data/bot_data.db
+!data/bot_data.db
