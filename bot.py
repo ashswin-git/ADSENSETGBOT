@@ -22,8 +22,10 @@ BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8770953822:AAFUbFpo9kDHFeyB5bQVNbpx
 ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "7831057346"))
 DB_FILE   = os.environ.get("DB_FILE", os.path.join(os.path.expanduser("~"), "bot_data.db"))
 WELCOME_PHOTO = str(pathlib.Path(__file__).parent / "welcome.jpg")
-MAX_ACCOUNTS = 3
-MAX_FAILS    = 5
+MAX_ACCOUNTS    = 3
+MAX_FAILS       = 5
+# Auto backup har 6 ghante mein (seconds)
+BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", str(6 * 3600)))
 
 print(f"Telethon {telethon.__version__} | DB: {DB_FILE}")
 
@@ -421,7 +423,13 @@ async def cmd_help(event):
             "/admin — Admin panel\n"
             "/start /help /cancel /myid /status\n"
             "/buy — Admin list show karo\n"
-        )
+        "\n🗄 **BACKUP & RESTORE:**\n"
+        "/backup — Cloud backup bhejo (Saved Msgs)\n"
+        "/restoredb — Backups list ya restore karo\n"
+        "/backupstatus — Backup system info\n"
+        "/gitsync — GitHub pe DB push karo\n"
+        "/syncstatus — GitHub sync status\n"
+    )
         await event.reply(msg, buttons=admin_kb(event.sender_id)); return
 
     # ── SUB ADMIN HELP ──
@@ -454,7 +462,13 @@ async def cmd_help(event):
             "/admin — Admin panel\n"
             "/start /help /cancel /myid /status\n"
             "/buy — Admin list show karo\n"
-        )
+        "\n🗄 **BACKUP & RESTORE:**\n"
+        "/backup — Cloud backup bhejo (Saved Msgs)\n"
+        "/restoredb — Backups list ya restore karo\n"
+        "/backupstatus — Backup system info\n"
+        "/gitsync — GitHub pe DB push karo\n"
+        "/syncstatus — GitHub sync status\n"
+    )
         await event.reply(msg, buttons=admin_kb(event.sender_id)); return
 
     # ── NORMAL USER HELP ──
@@ -1386,20 +1400,21 @@ async def cmd_approval(event):
 @bot.on(events.NewMessage(pattern=r"^/extend\s+(\d+)\s+(\d+)$"))
 async def cmd_extend(event):
     if not is_admin(event.sender_id): return
-    await _do_extend(event, int(event.pattern_match.group(1)), int(event.pattern_match.group(2)))
+    await _do_extend(event, int(event.pattern_match.group(1)), int(event.pattern_match.group(2)), event.sender_id)
 
-async def _do_extend(ctx, target_uid, days):
+async def _do_extend(ctx, target_uid, days, admin_uid=None):
+    admin_uid = admin_uid or ADMIN_ID
     row = c.execute("SELECT code,expires_at FROM access_codes WHERE claimed_by=? AND is_active=1", (target_uid,)).fetchone()
     if row:
         new_exp = (parse_iso(row[1]) + timedelta(days=days)).isoformat()
         await db_write("UPDATE access_codes SET expires_at=?,days_valid=days_valid+? WHERE code=?", (new_exp, days, row[0]))
-        await ctx.reply("✅ `" + str(target_uid) + "` +" + str(days) + " din. Expiry: " + new_exp.split("T")[0], buttons=admin_kb(event.sender_id))
+        await ctx.reply("✅ `" + str(target_uid) + "` +" + str(days) + " din. Expiry: " + new_exp.split("T")[0], buttons=admin_kb(admin_uid))
     else:
         code    = gen_code()
         expires = (now_utc() + timedelta(days=days)).isoformat()
         await db_write("INSERT INTO access_codes(code,days_valid,created_at,claimed_by,claimed_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?)",
-            (code, days, now_iso(), target_uid, now_iso(), expires, event.sender_id if hasattr(ctx,'sender_id') else ADMIN_ID))
-        await ctx.reply("✅ Code `" + code + "` given to `" + str(target_uid) + "`. Expiry: " + expires.split("T")[0], buttons=admin_kb(event.sender_id))
+            (code, days, now_iso(), target_uid, now_iso(), expires, admin_uid))
+        await ctx.reply("✅ Code `" + code + "` given to `" + str(target_uid) + "`. Expiry: " + expires.split("T")[0], buttons=admin_kb(admin_uid))
 
 @bot.on(events.NewMessage(pattern=r"^/revoke\s+(\S+)$"))
 async def cmd_revoke(event):
@@ -1561,7 +1576,8 @@ async def _do_broadcast(ctx, text):
             await bot.send_message(uid2, "📢 **Admin message:**\n\n" + text)
             sent += 1; await asyncio.sleep(0.3)
         except Exception: failed += 1
-    await prog.edit("📢 **Done!** ✅ " + str(sent) + " | ❌ " + str(failed), buttons=admin_kb(event.sender_id))
+    bcast_uid = getattr(ctx, 'sender_id', ADMIN_ID) or ADMIN_ID
+    await prog.edit("📢 **Done!** ✅ " + str(sent) + " | ❌ " + str(failed), buttons=admin_kb(bcast_uid))
 
 # ─────────────────────────── BUTTON HANDLERS ─────────────────
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "➕ Add Account"))
@@ -1595,6 +1611,11 @@ async def btn_redeem(event):
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "💬 Buy Access"))
 async def btn_buy(event):
     await cmd_buy(event)
+
+@bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "🗄 Backup"))
+async def btn_backup(event):
+    if not is_super_admin(event.sender_id): return
+    await cmd_backupstatus(event)
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.text.strip() == "❌ Cancel"))
 async def btn_cancel(event):
@@ -2189,7 +2210,7 @@ SKIP = {
     "🔑 Redeem Code", "🔧 Admin Panel", "👤 User Menu", "🔙 User Menu",
     "👥 Users", "📱 All Numbers", "🔑 Codes", "⏰ All Tasks",
     "➕ Gen Code", "📊 Stats", "📢 Broadcast", "❌ Cancel",
-    "📋 My Requests", "📜 Logs", "📋 Pending", "💬 Buy Access",
+    "📋 My Requests", "📜 Logs", "📋 Pending", "💬 Buy Access", "🗄 Backup", "🔄 Git Sync",
 }
 
 @bot.on(events.NewMessage(
@@ -2219,7 +2240,7 @@ async def on_text(event):
             days = int(text)
             if days < 1: raise ValueError
             target_uid = pending[uid]["target_uid"]
-            del pending[uid]; await _do_extend(event, target_uid, days)
+            del pending[uid]; await _do_extend(event, target_uid, days, uid)
         except ValueError: await event.reply("❌ Number bhejo (e.g. `7`)")
 
     elif act == "admin_broadcast":
@@ -2336,6 +2357,358 @@ async def restore_tasks():
             dead += 1
     print(f"Tasks: {ok} restored, {dead} disabled.")
 
+# ─────────────────────────── CLOUD BACKUP SYSTEM ────────────
+
+# ═══════════════════════════════════════════════════════════
+#  FULL DATA BACKUP SYSTEM
+#  Kya backup hota hai:
+#  1. bot_data.db  — Users, Admins, Codes, Tasks, Logs (sab)
+#  2. data.json    — Sab tables ka readable JSON export
+#  Dono files Saved Messages mein jaati hain
+#  session_str bhi DB mein stored hai — alag nahi chahiye
+# ═══════════════════════════════════════════════════════════
+
+def _make_json_export():
+    """Sab tables ka JSON export banao — readable format"""
+    tables = [
+        "users", "user_accounts", "access_codes",
+        "code_requests", "scheduled_tasks", "admins", "logs"
+    ]
+    export = {"backup_time": datetime.utcnow().isoformat(), "tables": {}}
+    for table in tables:
+        try:
+            rows = c.execute(f"SELECT * FROM {table}").fetchall()
+            cols = [d[0] for d in c.description]
+            export["tables"][table] = [dict(zip(cols, row)) for row in rows]
+        except Exception as e:
+            export["tables"][table] = []
+    return export
+
+async def _do_full_backup(notify=False):
+    """Full backup — DB + JSON — dono Saved Messages mein bhejo"""
+    import io
+    try:
+        if not os.path.exists(DB_FILE):
+            return False, "DB file nahi mili!"
+
+        stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
+
+        # ── Stats gather karo ──
+        try:
+            u_cnt  = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            a_cnt  = c.execute("SELECT COUNT(*) FROM user_accounts").fetchone()[0]
+            co_cnt = c.execute("SELECT COUNT(*) FROM access_codes").fetchone()[0]
+            t_cnt  = c.execute("SELECT COUNT(*) FROM scheduled_tasks").fetchone()[0]
+            ad_cnt = c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
+            lg_cnt = c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
+        except:
+            u_cnt = a_cnt = co_cnt = t_cnt = ad_cnt = lg_cnt = 0
+
+        db_sz = round(os.path.getsize(DB_FILE) / 1024, 1)
+
+        caption = (
+            "#ALEXADS_BACKUP\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🗄 **ALEXADS BOT — Full Data Backup**\n"
+            "📅 " + stamp + " UTC\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 **Data:**\n"
+            "  👥 Users: " + str(u_cnt) + "\n"
+            "  📱 Phone Accounts: " + str(a_cnt) + "\n"
+            "  🔑 Codes: " + str(co_cnt) + "\n"
+            "  ⏰ Tasks: " + str(t_cnt) + "\n"
+            "  👑 Admins: " + str(ad_cnt) + "\n"
+            "  📜 Logs: " + str(lg_cnt) + "\n"
+            "  💾 DB Size: " + str(db_sz) + " KB\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ Session strings bhi included hain (DB mein stored)\n"
+            "_Restore: /restoredb MESSAGE_ID"
+        )
+
+        # ── Step 1: DB file bhejo ──
+        db_msg = await bot.send_file(
+            ADMIN_ID,
+            DB_FILE,
+            caption=caption,
+            file_name="alexads_backup_" + stamp + ".db"
+        )
+
+        # ── Step 2: JSON export bhejo ──
+        export_data = _make_json_export()
+        json_bytes  = json.dumps(export_data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+        json_file   = io.BytesIO(json_bytes)
+        json_file.name = "alexads_data_" + stamp + ".json"
+
+        await bot.send_file(
+            ADMIN_ID,
+            json_file,
+            caption=(
+                "📋 **JSON Export** — " + stamp + "\n"
+                "Sabhi tables ka readable data.\n"
+                "DB Message ID: `" + str(db_msg.id) + "`"
+            ),
+            file_name="alexads_data_" + stamp + ".json"
+        )
+
+        if notify:
+            await bot.send_message(
+                ADMIN_ID,
+                "✅ **Auto Backup Complete!**\n\n"
+                "📅 " + stamp + "\n"
+                "🗄 DB Message ID: `" + str(db_msg.id) + "`\n\n"
+                "👥 " + str(u_cnt) + " users | 📱 " + str(a_cnt) + " accounts | 🔑 " + str(co_cnt) + " codes\n\n"
+                "Restore ke liye:\n"
+                "/restoredb " + str(db_msg.id)
+            )
+
+        # ── Also push to GitHub ──
+        asyncio.create_task(_git_push_db())
+        print(f"✅ Full backup done! DB msg={db_msg.id} | {u_cnt} users | {a_cnt} accounts")
+        return db_msg.id, None
+
+    except Exception as e:
+        print(f"⚠️ Backup failed: {e}")
+        return False, str(e)
+
+async def _git_push_db():
+    """DB ko GitHub pe push karo (background)"""
+    try:
+        sync_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git_sync.sh")
+        if not os.path.exists(sync_script):
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "bash", sync_script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode == 0:
+            print("✅ Git push done!")
+        else:
+            print("⚠️ Git push failed:", stderr.decode()[:200])
+    except asyncio.TimeoutError:
+        print("⚠️ Git push timeout")
+    except Exception as e:
+        print(f"⚠️ Git push error: {e}")
+
+# /gitsync — Manual GitHub sync (owner only)
+@bot.on(events.NewMessage(pattern=r"^/gitsync$"))
+async def cmd_gitsync(event):
+    if not is_super_admin(event.sender_id): return
+    msg = await event.reply("🔄 **GitHub pe DB push ho raha hai...**")
+    try:
+        sync_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git_sync.sh")
+        if not os.path.exists(sync_script):
+            await msg.edit("❌ git_sync.sh nahi mila!", buttons=admin_kb(event.sender_id)); return
+        proc = await asyncio.create_subprocess_exec(
+            "bash", sync_script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        out = stdout.decode().strip()
+        err = stderr.decode().strip()
+        if proc.returncode == 0:
+            last = out.split("\n")[-1] if out else "Done!"
+            await msg.edit(
+                "✅ **GitHub Sync Complete!**\n\n"
+                "📤 DB GitHub pe push ho gaya!\n"
+                "📝 " + last + "\n\n"
+                "_Naye system pe: bash install.sh_",
+                buttons=admin_kb(event.sender_id)
+            )
+        else:
+            await msg.edit(
+                "❌ **Git Push Failed!**\n\n"
+                "Error: " + (err or out)[:200] + "\n\n"
+                "Fix: bash git_setup.sh chalaao",
+                buttons=admin_kb(event.sender_id)
+            )
+    except asyncio.TimeoutError:
+        await msg.edit("⏰ Timeout! 60s se zyada laga.", buttons=admin_kb(event.sender_id))
+    except Exception as e:
+        await msg.edit("❌ Error: " + str(e), buttons=admin_kb(event.sender_id))
+
+# /syncstatus — GitHub sync info
+@bot.on(events.NewMessage(pattern=r"^/syncstatus$"))
+async def cmd_syncstatus(event):
+    if not is_super_admin(event.sender_id): return
+    bot_dir   = os.path.dirname(os.path.abspath(__file__))
+    has_sync  = os.path.exists(os.path.join(bot_dir, "git_sync.sh"))
+    has_token = os.path.exists(os.path.join(bot_dir, ".git_token"))
+    has_data  = os.path.exists(os.path.join(bot_dir, "data", "bot_data.db"))
+    has_log   = os.path.exists(os.path.join(bot_dir, "sync.log"))
+    last_sync = "Koi sync nahi hua abhi tak"
+    if has_log:
+        try:
+            with open(os.path.join(bot_dir, "sync.log")) as f:
+                slines = f.readlines()
+            for line in reversed(slines):
+                if "Pushed" in line or "No changes" in line:
+                    last_sync = line.strip()[-80:]; break
+        except: pass
+    db_sz = round(os.path.getsize(DB_FILE) / 1024, 1) if os.path.exists(DB_FILE) else 0
+    out = (
+        "📊 **GitHub Sync Status**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔧 git_sync.sh: " + ("✅" if has_sync else "❌ Missing!") + "\n"
+        "🔑 Git Token: " + ("✅ Set" if has_token else "❌ Run git_setup.sh!") + "\n"
+        "💾 data/bot_data.db: " + ("✅ " + str(db_sz) + " KB" if has_data else "❌ Not synced yet") + "\n\n"
+        "🕐 Last sync:\n`" + last_sync + "`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "**Commands:**\n"
+        "/gitsync — Abhi GitHub pe push karo\n"
+        "/backup — Telegram + GitHub backup\n\n"
+        "**New system setup:**\n"
+        "`bash install.sh`"
+    )
+    await event.reply(out, buttons=admin_kb(event.sender_id))
+
+@bot.on(events.NewMessage(pattern=r"^/backup$"))
+async def cmd_backup(event):
+    if not is_super_admin(event.sender_id): return
+    msg = await event.reply(
+        "🔄 **Full Backup ho raha hai...**\n\n"
+        "📦 DB file + JSON export dono bhej raha hoon Saved Messages mein..."
+    )
+    mid, err = await _do_full_backup(notify=False)
+    if mid:
+        await msg.edit(
+            "✅ **Full Backup Complete!**\n\n"
+            "📤 2 files Saved Messages mein:\n"
+            "  🗄 DB file (restore ke liye)\n"
+            "  📋 JSON export (readable data)\n\n"
+            "🆔 DB Message ID: `" + str(mid) + "`\n\n"
+            "New system pe restore:\n"
+            "`/restoredb " + str(mid) + "`",
+            buttons=admin_kb(event.sender_id)
+        )
+    else:
+        await msg.edit("❌ Backup fail!\n\nError: " + str(err), buttons=admin_kb(event.sender_id))
+
+# /restoredb MESSAGE_ID — Saved Messages se DB download + restore
+@bot.on(events.NewMessage(pattern=r"^/restoredb(?:\s+(\d+))?$"))
+async def cmd_restoredb(event):
+    if not is_super_admin(event.sender_id): return
+    msg_id = event.pattern_match.group(1)
+    
+    if not msg_id:
+        # List recent backups from saved messages
+        msg = await event.reply("🔍 Recent backups dhundh raha hoon...")
+        try:
+            backups = []
+            async for m in bot.iter_messages(ADMIN_ID, limit=50, search="ALEXADS BOT — Auto Backup"):
+                if m.file and m.file.name and m.file.name.endswith(".db"):
+                    stamp   = m.date.strftime("%Y-%m-%d %H:%M") if m.date else "?"
+                    sz      = round(m.file.size / 1024, 1) if m.file.size else 0
+                    backups.append((m.id, stamp, sz))
+                if len(backups) >= 10:
+                    break
+            
+            if not backups:
+                await msg.edit(
+                    "📦 **Koi backup nahi mila!**\n\n"
+                    "Pehle /backup se backup lo.\n"
+                    "Phir naye system pe /restoredb MESSAGE_ID se restore karo.",
+                    buttons=admin_kb(event.sender_id)
+                ); return
+            
+            lines = ["📦 **Recent Backups (Saved Messages se):**\n"]
+            for mid2, stamp2, sz2 in backups:
+                lines.append(f"🗄 `{stamp2}` | {sz2} KB\n   👉 `/restoredb {mid2}`")
+            await msg.edit("\n\n".join(lines), buttons=admin_kb(event.sender_id))
+        except Exception as e:
+            await msg.edit(f"❌ Error: {e}", buttons=admin_kb(event.sender_id))
+        return
+    
+    # Restore from specific message ID
+    msg = await event.reply(f"⬇️ Message #{msg_id} se DB download ho raha hai...")
+    try:
+        # Download from saved messages
+        tg_msg = await bot.get_messages(ADMIN_ID, ids=int(msg_id))
+        if not tg_msg or not tg_msg.file:
+            await msg.edit("❌ Message nahi mila ya file nahi hai!", buttons=admin_kb(event.sender_id)); return
+        if not tg_msg.file.name.endswith(".db"):
+            await msg.edit("❌ Yeh DB file nahi hai!", buttons=admin_kb(event.sender_id)); return
+        
+        # Current DB ka local backup
+        if os.path.exists(DB_FILE):
+            stamp_bk = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            bk_path  = DB_FILE + ".bak_" + stamp_bk
+            import shutil
+            shutil.copy2(DB_FILE, bk_path)
+        
+        await msg.edit("⬇️ Downloading...")
+        # Download to temp then replace
+        tmp_path = DB_FILE + ".tmp"
+        await bot.download_media(tg_msg, file=tmp_path)
+        
+        # Verify downloaded file is valid SQLite
+        try:
+            test_conn = sqlite3.connect(tmp_path)
+            tables    = test_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            test_conn.close()
+            if not tables:
+                raise Exception("Empty DB!")
+        except Exception as ve:
+            os.remove(tmp_path)
+            await msg.edit(f"❌ Invalid DB file: {ve}", buttons=admin_kb(event.sender_id)); return
+        
+        # Replace current DB
+        import shutil
+        shutil.move(tmp_path, DB_FILE)
+        
+        # Reload DB connection
+        global conn, c
+        conn.close()
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        c    = conn.cursor()
+        
+        # Stats of restored DB
+        try:
+            users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            codes = c.execute("SELECT COUNT(*) FROM access_codes").fetchone()[0]
+            tasks = c.execute("SELECT COUNT(*) FROM scheduled_tasks").fetchone()[0]
+            admins_cnt = c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
+            stats = (
+                f"👥 Users: {users}\n"
+                f"👑 Admins: {admins_cnt}\n"
+                f"🔑 Codes: {codes}\n"
+                f"⏰ Tasks: {tasks}"
+            )
+        except:
+            stats = "Stats load nahi hui."
+        
+        stamp3 = tg_msg.date.strftime("%Y-%m-%d %H:%M") if tg_msg.date else "?"
+        await msg.edit(
+            "✅ **Restore Complete!**\n\n"
+            "📅 Backup date: " + stamp3 + "\n\n"
+            "📊 **Restored Data:**\n" + stats + "\n\n"
+            "🔄 Bot restart karo tasks dobara chalane ke liye:\n"
+            "`pkill -f bot.py && python bot.py`",
+            buttons=admin_kb(event.sender_id)
+        )
+    except Exception as e:
+        await msg.edit(f"❌ Restore fail: {e}", buttons=admin_kb(event.sender_id))
+
+# /backupstatus — Backup info
+@bot.on(events.NewMessage(pattern=r"^/backupstatus$"))
+async def cmd_backupstatus(event):
+    if not is_super_admin(event.sender_id): return
+    db_sz = round(os.path.getsize(DB_FILE) / 1024, 1) if os.path.exists(DB_FILE) else 0
+    interval_h = BACKUP_INTERVAL // 3600
+    await event.reply(
+        "🗄 **Backup Status**\n\n"
+        f"💾 DB Size: `{db_sz} KB`\n"
+        f"⏱ Auto Backup: har **{interval_h} ghante**\n"
+        f"📤 Location: Tumhare Saved Messages\n\n"
+        "**Commands:**\n"
+        "/backup — Abhi backup lo\n"
+        "/restoredb — Recent backups list\n"
+        "/restoredb MSG_ID — Specific backup restore karo",
+        buttons=admin_kb(event.sender_id)
+    )
+
 # ─────────────────────────── MAIN ────────────────────────────
 async def main():
     global db_lock
@@ -2344,7 +2717,9 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     print("Connected!")
     await restore_tasks()
-    print("Ready! Bot chal raha hai.")
+    # Auto backup loop start
+    asyncio.create_task(_auto_backup_loop())
+    print(f"✅ Auto backup every {BACKUP_INTERVAL//3600}h | Ready!")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
