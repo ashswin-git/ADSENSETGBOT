@@ -2709,6 +2709,21 @@ async def cmd_backupstatus(event):
         buttons=admin_kb(event.sender_id)
     )
 
+async def _auto_backup_loop():
+    """Har BACKUP_INTERVAL seconds pe automatically backup lo"""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            mid, err = await _do_full_backup(notify=False)
+            if mid:
+                asyncio.create_task(_git_push_db())
+                print(f"Auto backup OK: msg {mid}")
+            else:
+                print(f"Auto backup failed: {err}")
+        except Exception as e:
+            print(f"Auto backup error: {e}")
+        await asyncio.sleep(BACKUP_INTERVAL)
+
 # ─────────────────────────── MAIN ────────────────────────────
 async def main():
     global db_lock
@@ -2717,7 +2732,6 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     print("Connected!")
     await restore_tasks()
-    # Auto backup loop start
     asyncio.create_task(_auto_backup_loop())
     print(f"✅ Auto backup every {BACKUP_INTERVAL//3600}h | Ready!")
     await bot.run_until_disconnected()
