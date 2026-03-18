@@ -1132,9 +1132,15 @@ async def _show_userinfo(ctx, uid, requester_id=None):
         await ctx.edit(out, buttons=btns, parse_mode='md')
     except Exception:
         try:
-            await ctx.reply(out, buttons=btns, parse_mode='md')
-        except Exception as e:
-            print(f"userinfo error: {e}")
+            await ctx.respond(out, buttons=btns, parse_mode='md')
+        except Exception:
+            try:
+                await bot.send_message(
+                    ctx.sender_id if hasattr(ctx, 'sender_id') else ctx.chat_id,
+                    out, buttons=btns, parse_mode='md'
+                )
+            except Exception as e:
+                print(f"userinfo error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/ban\s+(\d+)$"))
 async def cmd_ban(event):
@@ -1940,6 +1946,12 @@ async def cb_acct(event):
             [Button.inline("❌ Cancel", b"cx")],
         ]
     )
+
+IV_MAP = {
+    b"iv5":300, b"iv10":600, b"iv15":900, b"iv30":1800,
+    b"iv45":2700, b"iv60":3600, b"iv120":7200, b"iv180":10800,
+    b"iv360":21600, b"iv720":43200, b"iv1440":86400,
+}
 
 @bot.on(events.CallbackQuery(data=lambda d: d in IV_MAP))
 async def cb_interval(event):
