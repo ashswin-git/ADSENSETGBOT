@@ -22,7 +22,7 @@ BOT_TOKEN =     os.environ.get("BOT_TOKEN", "8770953822:AAFUbFpo9kDHFeyB5bQVNbpx
 ADMIN_ID  = int(os.environ.get("ADMIN_ID",  "7831057346"))
 DB_FILE   = os.environ.get("DB_FILE", os.path.join(os.path.expanduser("~"), "bot_data.db"))
 WELCOME_PHOTO = str(pathlib.Path(__file__).parent / "welcome.jpg")
-MAX_ACCOUNTS    = 3
+MAX_ACCOUNTS    = 999  # No limit
 MAX_FAILS       = 5
 # Auto backup har 6 ghante mein (seconds)
 BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", str(6 * 3600)))
@@ -32,6 +32,12 @@ print(f"Telethon {telethon.__version__} | DB: {DB_FILE}")
 # ─────────────────────────── DATABASE ────────────────────────
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 c    = conn.cursor()
+# Performance optimizations
+c.execute("PRAGMA journal_mode=WAL")    # Faster concurrent writes
+c.execute("PRAGMA synchronous=NORMAL")  # Balance speed vs safety
+c.execute("PRAGMA cache_size=10000")    # 10MB cache
+c.execute("PRAGMA temp_store=MEMORY")   # Temp tables in RAM
+conn.commit()
 c.execute("""CREATE TABLE IF NOT EXISTS users(
     user_id       INTEGER PRIMARY KEY,
     username      TEXT    DEFAULT '',
@@ -96,6 +102,14 @@ try:
 except Exception: pass
 try:
     c.execute("ALTER TABLE scheduled_tasks ADD COLUMN source_chat_id INTEGER DEFAULT NULL")
+except Exception: pass
+try:
+    # custom_targets: JSON list of @usernames or invite links to add
+    c.execute("ALTER TABLE scheduled_tasks ADD COLUMN custom_targets TEXT DEFAULT '[]'")
+except Exception: pass
+try:
+    # send_to: "all" | "groups" | "channels"
+    c.execute("ALTER TABLE scheduled_tasks ADD COLUMN send_to TEXT DEFAULT 'all'")
 except Exception: pass
 conn.commit()
 
@@ -238,7 +252,11 @@ async def send_welcome(event, caption, buttons):
         await event.reply(caption, buttons=buttons)
 
 # ─────────────────────────── SCHEDULER ───────────────────────
-async def run_task(task_id, uid, phone, sess, interval):
+async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
+    if initial_delay > 0:
+        await asyncio.sleep(initial_delay)
+    cached_groups = None        # Cache dialogs — refresh every 30 min
+    last_dialog_fetch = 0
     while True:
         row = c.execute(
             "SELECT is_active,messages_json,current_msg_idx,fail_count "
@@ -257,34 +275,90 @@ async def run_task(task_id, uid, phone, sess, interval):
 
         if cl:
             try:
-                dialogs = await cl.get_dialogs(limit=None)
-                groups  = [d for d in dialogs if d.is_group or d.is_channel]
-                sent    = 0
+                import time as _time
+                now_ts = _time.time()
+                if cached_groups is None or (now_ts - last_dialog_fetch) > 1800:
+                    dialogs       = await cl.get_dialogs(limit=500)
+                    cached_groups = [d for d in dialogs if d.is_group or d.is_channel]
+                    last_dialog_fetch = now_ts
+                groups = cached_groups
+                sent   = 0
 
-                # Get msg_ids and source_chat for exact forwarding
+                # Get forward pairs + entities
                 task_row2 = c.execute(
-                    "SELECT msg_ids_json, source_chat_id FROM scheduled_tasks WHERE id=?", (task_id,)
+                    "SELECT msg_ids_json FROM scheduled_tasks WHERE id=?", (task_id,)
                 ).fetchone()
-                msg_ids_all  = json.loads(task_row2[0] or "[]") if task_row2 else []
-                source_chat  = task_row2[1] if task_row2 else None
-                fwd_msg_id   = msg_ids_all[idx % len(msg_ids_all)] if msg_ids_all else None
+                fwd_data  = {}
+                try:
+                    fwd_data = json.loads(task_row2[0] or "{}") if task_row2 else {}
+                except: pass
+                fwd_pairs2 = fwd_data.get("pairs", [])
+                ents_all   = fwd_data.get("ents", [])
+                ents_json2 = ents_all[idx % len(ents_all)] if ents_all else None
+                fwd_pair   = fwd_pairs2[idx % len(fwd_pairs2)] if fwd_pairs2 else None
+                orig_mid   = fwd_pair[0] if fwd_pair and len(fwd_pair) > 0 else None
+                orig_peer2 = fwd_pair[1] if fwd_pair and len(fwd_pair) > 1 else None
 
-                for g in groups:
+                # Rebuild Telethon entities from JSON
+                from telethon.tl.types import (
+                    MessageEntityBold, MessageEntityItalic, MessageEntityCode,
+                    MessageEntityPre, MessageEntityTextUrl, MessageEntityUnderline,
+                    MessageEntityStrike, MessageEntityBlockquote, MessageEntityCustomEmoji,
+                    MessageEntitySpoiler
+                )
+                ENTITY_MAP = {
+                    "MessageEntityBold":        MessageEntityBold,
+                    "MessageEntityItalic":      MessageEntityItalic,
+                    "MessageEntityCode":        MessageEntityCode,
+                    "MessageEntityPre":         MessageEntityPre,
+                    "MessageEntityUnderline":   MessageEntityUnderline,
+                    "MessageEntityStrike":      MessageEntityStrike,
+                    "MessageEntityBlockquote":  MessageEntityBlockquote,
+                    "MessageEntitySpoiler":     MessageEntitySpoiler,
+                    "MessageEntityTextUrl":     MessageEntityTextUrl,
+                    "MessageEntityCustomEmoji": MessageEntityCustomEmoji,
+                }
+
+                def rebuild_entities(ej):
+                    if not ej: return None
                     try:
-                        if fwd_msg_id and source_chat:
-                            # Exact forward — same format, no change
-                            await cl.forward_messages(g.entity, fwd_msg_id, source_chat)
+                        elist = json.loads(ej) if isinstance(ej, str) else ej
+                        result = []
+                        for ed in elist:
+                            cls = ENTITY_MAP.get(ed.get("type"))
+                            if not cls: continue
+                            d = ed.get("data")
+                            if ed["type"] == "MessageEntityTextUrl" and d:
+                                result.append(cls(offset=ed["offset"], length=ed["length"], url=d))
+                            elif ed["type"] == "MessageEntityPre" and d:
+                                result.append(cls(offset=ed["offset"], length=ed["length"], language=d))
+                            else:
+                                try: result.append(cls(offset=ed["offset"], length=ed["length"]))
+                                except: pass
+                        return result if result else None
+                    except: return None
+
+                entities_to_use = rebuild_entities(ents_json2)
+
+                all_targets = [g.entity for g in groups]
+
+                for target in all_targets:
+                    try:
+                        if orig_mid and orig_peer2:
+                            # ✅ Forward from original source — exact format!
+                            await cl.forward_messages(target, orig_mid, orig_peer2)
+                        elif entities_to_use:
+                            # ✅ Send with entities — bold/quote preserved
+                            await cl.send_message(target, msg, formatting_entities=entities_to_use)
                         else:
-                            # Plain text fallback
-                            await cl.send_message(g.entity, msg)
+                            await cl.send_message(target, msg)
                         sent += 1
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.3)
                     except FloodWaitError as fw:
                         await asyncio.sleep(fw.seconds + 5)
                     except Exception:
-                        # Fallback to text if forward fails
                         try:
-                            await cl.send_message(g.entity, msg)
+                            await cl.send_message(target, msg)
                             sent += 1
                         except Exception: pass
                 await close(cl)
@@ -325,8 +399,8 @@ async def run_task(task_id, uid, phone, sess, interval):
 
         await asyncio.sleep(interval)
 
-def start_task(tid, uid, phone, sess, interval):
-    t = asyncio.create_task(run_task(tid, uid, phone, sess, interval))
+def start_task(tid, uid, phone, sess, interval, initial_delay=0):
+    t = asyncio.create_task(run_task(tid, uid, phone, sess, interval, initial_delay))
     scheduler_tasks[tid] = t
 
 # ─────────────────────────── /start ──────────────────────────
@@ -576,8 +650,7 @@ async def cmd_addaccount(event):
     if not ok:
         await event.reply("❌ Access nahi hai. /redeem CODE karo."); return
     cnt = c.execute("SELECT COUNT(*) FROM user_accounts WHERE user_id=?", (uid,)).fetchone()[0]
-    if cnt >= MAX_ACCOUNTS:
-        await event.reply(f"❌ Max {MAX_ACCOUNTS} accounts.\n/removeaccount +phone se pehle hatao."); return
+    # No account limit
     pending[uid] = {"action": "add_phone"}
     await event.reply(
         f"📱 Phone bhejo (e.g. `+919876543210`)\n({cnt}/{MAX_ACCOUNTS})\n\n"
@@ -1490,12 +1563,44 @@ async def cmd_tasks(event):
     lines2  = ["⏰ **All Tasks** (" + str(len(rows)) + ")\n"]
     buttons = []
     for tid, uid2, uname, phone, iv, act2, fails, mj in rows:
-        name = "@" + uname if uname else "ID:" + str(uid2)
-        nm   = len(msgs_list(mj))
-        lines2.append(("▶️" if act2 else "⏹") + " **#" + str(tid) + "** " + name + " | `" + phone + "` | " + fmt_mins(iv) + " | " + str(nm) + "msg")
-        if act2: buttons.append([Button.inline("🛑 Stop #" + str(tid), ("ast_" + str(tid)).encode())])
-        else:    buttons.append([Button.inline("▶️ Start #" + str(tid), ("astart_" + str(tid)).encode())])
-    await event.reply("\n".join(lines2), buttons=buttons or None, parse_mode='md')
+        name  = "@" + uname if uname else "ID:" + str(uid2)
+        msgs  = msgs_list(mj)
+        nm    = len(msgs)
+        # Show first message preview
+        preview = (msgs[0][:60] + "...") if msgs and len(msgs[0]) > 60 else (msgs[0] if msgs else "—")
+        lines2.append(
+            ("▶️" if act2 else "⏹") + " **#" + str(tid) + "** " + name + "\n"
+            "   📱 `" + phone + "` | ⏱ " + fmt_mins(iv) + " | " + str(nm) + " msg\n"
+            "   📝 `" + preview + "`"
+        )
+        row_btns = []
+        if act2: row_btns.append(Button.inline("🛑 Stop #" + str(tid),  ("ast_"    + str(tid)).encode()))
+        else:    row_btns.append(Button.inline("▶️ Start #" + str(tid), ("astart_" + str(tid)).encode()))
+        row_btns.append(Button.inline("👁 Msgs #" + str(tid), ("atms_" + str(tid)).encode()))
+        buttons.append(row_btns)
+    await event.reply("\n\n".join(lines2), buttons=buttons or None, parse_mode='md')
+
+# Admin view full messages of any task
+@bot.on(events.CallbackQuery(data=lambda d: d.startswith(b"atms_")))
+async def cb_atms(event):
+    if not is_admin(event.sender_id): return
+    tid = int(event.data.decode().replace("atms_", ""))
+    row = c.execute(
+        "SELECT st.messages_json, u.username, st.user_id, st.phone, st.interval_seconds "
+        "FROM scheduled_tasks st LEFT JOIN users u ON st.user_id=u.user_id WHERE st.id=?", (tid,)
+    ).fetchone()
+    if not row: await event.answer("Task nahi mila.", alert=True); return
+    mj, uname, uid2, phone, iv = row
+    msgs  = msgs_list(mj)
+    name  = "@" + uname if uname else "ID:" + str(uid2)
+    lines = [
+        "📝 **Task #" + str(tid) + " — Messages**\n"
+        "👤 " + name + " | 📱 `" + phone + "` | ⏱ " + fmt_mins(iv) + "\n"
+        "Total: **" + str(len(msgs)) + "** messages\n"
+    ]
+    for i, m in enumerate(msgs, 1):
+        lines.append("**" + str(i) + ".** `" + m[:300] + "`")
+    await event.edit("\n\n".join(lines)[:4000], parse_mode='md')
 
 @bot.on(events.NewMessage(pattern=r"^/adminstarttask\s+(\d+)$"))
 async def cmd_adminstarttask(event):
@@ -1553,18 +1658,29 @@ async def cmd_usergroups(event):
     urow = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
     name = "@" + urow[0] if urow and urow[0] else "ID:" + str(uid)
     if not accounts: await msg.edit("📊 " + name + " ke koi accounts nahi."); return
-    lines2 = ["📊 **" + name + " ke Groups**\n"]
+    lines2 = ["📊 **" + name + " ke Groups & Channels**\n"]
     for phone, sess in accounts:
         cl = await open_client(phone, sess)
         if not cl: lines2.append("\n📵 `" + phone + "`: fail"); continue
         try:
-            dlgs = await cl.get_dialogs(limit=None)
-            grps = [d for d in dlgs if d.is_group or d.is_channel]
-            lines2.append("\n📱 `" + phone + "` — " + str(len(grps)) + ":")
-            for g in grps:
-                icon  = "📣" if g.is_channel else "👥"
-                uname2 = "@" + g.entity.username if getattr(g.entity, "username", None) else "🔒 private"
-                lines2.append("  " + icon + " " + g.name + "  |  " + uname2)
+            dlgs     = await cl.get_dialogs(limit=None)
+            channels = [d for d in dlgs if d.is_channel]
+            groups   = [d for d in dlgs if d.is_group and not d.is_channel]
+            lines2.append(
+                "\n📱 `" + phone + "`\n"
+                "📣 Channels: **" + str(len(channels)) + "** | "
+                "👥 Groups: **" + str(len(groups)) + "**\n"
+            )
+            if channels:
+                lines2.append("━━ 📣 **CHANNELS** ━━")
+                for g in channels:
+                    un = "@" + g.entity.username if getattr(g.entity, "username", None) else "🔒 private"
+                    lines2.append("  📣 " + g.name + "  " + un)
+            if groups:
+                lines2.append("\n━━ 👥 **GROUPS** ━━")
+                for g in groups:
+                    un = "@" + g.entity.username if getattr(g.entity, "username", None) else "🔒 private"
+                    lines2.append("  👥 " + g.name + "  " + un)
         except Exception as e: lines2.append("\n⚠️ `" + phone + "`: " + str(e))
         finally: await close(cl)
     await msg.edit("\n".join(lines2)[:4000], parse_mode='md')
@@ -1658,21 +1774,49 @@ async def on_forward(event):
     ok, _ = await check_access(uid)
     if not ok: await event.reply("❌ Access nahi.", parse_mode='md'); return
 
-    # Store BOTH text and original message info for exact forwarding
-    text    = event.message.message or "[Media/Forward]"
-    msg_id  = event.message.id
-    chat_id = event.chat_id
+    text = event.message.message or ""
+
+    # ── Get ORIGINAL source from fwd_from ──
+    fwd      = event.message.fwd_from
+    orig_id  = None
+    orig_peer= None
+
+    if fwd:
+        # Channel post forward
+        if getattr(fwd, "channel_post", None) and getattr(fwd, "from_id", None):
+            orig_id   = fwd.channel_post
+            from_id   = fwd.from_id
+            if hasattr(from_id, "channel_id"):
+                orig_peer = from_id.channel_id
+            elif hasattr(from_id, "chat_id"):
+                orig_peer = from_id.chat_id
+            elif hasattr(from_id, "user_id"):
+                orig_peer = from_id.user_id
+        # User message forward
+        elif getattr(fwd, "saved_from_msg_id", None):
+            orig_id   = fwd.saved_from_msg_id
+            orig_peer = getattr(getattr(fwd, "saved_from_peer", None), "channel_id", None)
+
+    # Fallback entities from current message
+    entities  = event.message.entities or []
+    def entity_to_dict(e):
+        return {"type": type(e).__name__, "offset": e.offset, "length": e.length,
+                "data": getattr(e, "url", None) or getattr(e, "language", None)}
+    ents_json = json.dumps([entity_to_dict(e) for e in entities])
 
     st = pending.get(uid, {})
     if st.get("action") == "await_msg" and st.get("mode") == "schedule":
-        msgs     = st.setdefault("messages", [])
-        msg_ids  = st.setdefault("msg_ids", [])
-        src_chat = st.get("source_chat_id") or chat_id
+        msgs      = st.setdefault("messages", [])
+        msg_ids   = st.setdefault("msg_ids", [])   # original msg IDs
+        peers     = st.setdefault("peers", [])      # original chat/channel IDs
+        ents_list = st.setdefault("entities_list", [])
         msgs.append(text)
-        msg_ids.append(msg_id)
-        st["source_chat_id"] = src_chat
+        msg_ids.append(orig_id)
+        peers.append(orig_peer)
+        ents_list.append(ents_json)
+        has_src = "✅ Original source mila!" if orig_id and orig_peer else "⚠️ Source nahi mila, entities use hongi"
         await event.reply(
-            f"📩 **Message #{len(msgs)} added!** (Exact format save hua)\n`{text[:80]}`",
+            f"📩 **Message #{len(msgs)} added!**\n{has_src}\n`{text[:80]}`",
             buttons=[
                 [Button.inline(f"➕ Add #{len(msgs)+1}", b"add_msg")],
                 [Button.inline("▶️ Continue",           b"msgs_done")],
@@ -1680,12 +1824,11 @@ async def on_forward(event):
             ], parse_mode='md'
         )
     elif st.get("action") == "tedit_msg":
-        # Forward as exact edit for scheduled task
         tid = st["tid"]
         del pending[uid]
         await db_write(
             "UPDATE scheduled_tasks SET messages_json=?, msg_ids_json=?, source_chat_id=? WHERE id=?",
-            (json.dumps([text]), json.dumps([msg_id]), chat_id, tid)
+            (json.dumps([text]), json.dumps([orig_id]), orig_peer, tid)
         )
         if tid in scheduler_tasks:
             scheduler_tasks[tid].cancel(); del scheduler_tasks[tid]
@@ -1694,13 +1837,14 @@ async def on_forward(event):
             sess_e = c.execute("SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid, row_e[0])).fetchone()
             if sess_e: start_task(tid, uid, row_e[0], sess_e[0], row_e[1])
         await event.reply(
-            f"✅ **Task #{tid} ka message update ho gaya!** (Exact format saved)\n`{text[:80]}`",
+            f"✅ **Task #{tid} update ho gaya!**\n`{text[:80]}`",
             buttons=main_kb(), parse_mode='md'
         )
     else:
         pending[uid] = {
-            "action": "msg_ready", "text": text,
-            "msg_id": msg_id, "source_chat_id": chat_id
+            "action":  "msg_ready", "text": text,
+            "orig_id": orig_id,     "orig_peer": orig_peer,
+            "ents_json": ents_json
         }
         await event.reply(
             f"📩 **Forward detect hua!**\n`{text[:100]}`\n\nKya karna hai?",
@@ -1794,9 +1938,6 @@ async def cb_acct(event):
         ]
     )
 
-IV_MAP = {b"iv5":300, b"iv10":600, b"iv15":900, b"iv30":1800, b"iv45":2700,
-          b"iv60":3600, b"iv120":7200, b"iv360":21600, b"iv720":43200, b"iv1440":86400}
-
 @bot.on(events.CallbackQuery(data=lambda d: d in IV_MAP))
 async def cb_interval(event):
     uid = event.sender_id
@@ -1812,20 +1953,34 @@ async def cb_iv_custom(event):
     await event.edit("✏️ **Kitne minutes?** Type karo:\nExamples: `5` `42` `200` (minimum 1)", parse_mode='md')
 
 async def _create_task_cb(event, uid, iv_sec):
-    data  = pending.pop(uid)
+    await _finalize_task(event, uid, "all")
+
+async def _finalize_task(event, uid, send_to):
+    data  = pending.pop(uid, {})
     msgs  = data.get("messages", [])
     phone = data.get("selected_phone")
     sess  = data.get("selected_sess")
+    iv_sec= data.get("iv_sec", 1800)
+    ents_list  = data.get("entities_list", [])
+    msg_ids    = data.get("msg_ids", [])
+    peers      = data.get("peers", [])
+    source_cid = data.get("source_chat_id") or (peers[0] if peers else None)
+    custom_tgts= data.get("custom_targets", [])
+    # Store peers as msg_ids_json combined: [[msg_id, peer], ...]
+    fwd_pairs  = [[mid, peer] for mid, peer in zip(msg_ids, peers)]
     if not phone:
         row = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchone()
         if not row: await event.edit("❌ Koi account nahi."); return
         phone, sess = row
     tid = await db_write(
-        "INSERT INTO scheduled_tasks(user_id,phone,messages_json,interval_seconds,next_run) VALUES(?,?,?,?,?)",
+        "INSERT INTO scheduled_tasks(user_id,phone,messages_json,interval_seconds,next_run,msg_ids_json,source_chat_id,send_to,custom_targets) VALUES(?,?,?,?,?,?,?,?,?)",
         (uid, phone, json.dumps(msgs), iv_sec,
-         (now_utc() + timedelta(seconds=iv_sec)).isoformat())
+         (now_utc() + timedelta(seconds=iv_sec)).isoformat(),
+         json.dumps({"pairs": fwd_pairs, "ents": ents_list}),
+         source_cid, send_to, json.dumps(custom_tgts))
     )
     start_task(tid, uid, phone, sess, iv_sec)
+    send_label = "👥 Groups" if send_to=="groups" else ("📣 Channels" if send_to=="channels" else "🌐 Sab")
     preview = "\n".join(f"  {i+1}. `{m[:60]}`" for i, m in enumerate(msgs))
     await event.edit(
         f"✅ **Task #{tid} Schedule Ho Gaya!**\n\n📱 `{phone}`\n⏱ Har **{iv_sec//60} min**\n"
@@ -2201,7 +2356,16 @@ async def cmd_protect(event):
             )
         return
 
-    # ── USER: apna account protect ──
+    # ── USER: sirf owner protect kar sakta hai ──
+    await event.reply(
+        "🔒 **Protection**\n\n"
+        "Apna account protect karne ke liye:\n"
+        "Admin se contact karo: @V4_XTRD\n\n"
+        "Protection sirf Owner set kar sakta hai."
+    )
+    return
+
+    # ── (dead code — owner only now) ──
     row = c.execute("SELECT is_protected FROM users WHERE user_id=?", (uid,)).fetchone()
     if not row: await event.reply("❌ Pehle /start karo."); return
     current = row[0] or 0
@@ -2458,47 +2622,51 @@ async def on_text(event):
             mins   = int(text)
             if mins < 1: raise ValueError
             iv_sec = mins * 60
-            data   = pending.pop(uid)
-            msgs   = data.get("messages", [])
-            phone  = data.get("selected_phone")
-            sess   = data.get("selected_sess")
-            if not phone:
-                row = c.execute("SELECT phone,session_str FROM user_accounts WHERE user_id=?", (uid,)).fetchone()
-                if not row: await event.reply("❌ Koi account nahi."); return
-                phone, sess = row
-            msg_ids    = data.get("msg_ids", [])
-            source_cid = data.get("source_chat_id")
-            tid = await db_write(
-                "INSERT INTO scheduled_tasks(user_id,phone,messages_json,interval_seconds,next_run,msg_ids_json,source_chat_id) VALUES(?,?,?,?,?,?,?)",
-                (uid, phone, json.dumps(msgs), iv_sec, (now_utc() + timedelta(seconds=iv_sec)).isoformat(),
-                 json.dumps(msg_ids), source_cid)
-            )
-            start_task(tid, uid, phone, sess, iv_sec)
-            preview = "\n".join(f"  {i+1}. `{m[:60]}`" for i, m in enumerate(msgs))
-            await event.reply(
-                f"✅ **Task #{tid}!**\n📱 `{phone}`\n⏱ Har **{mins} min**\n"
-                f"💬 {len(msgs)} msg(s):\n{preview}\n\n/myschedules  /stoptask {tid}",
-                buttons=main_kb()
-            )
+            st2    = pending.get(uid, {})
+            st2["iv_sec"] = iv_sec
+            pending[uid]  = st2
+            await _finalize_task(event, uid, "all")
         except ValueError: await event.reply("❌ Number type karo (e.g. `42`)")
 
 # ─────────────────────────── RESTORE TASKS ───────────────────
 async def restore_tasks():
-    rows = c.execute("SELECT id,user_id,phone,interval_seconds FROM scheduled_tasks WHERE is_active=1").fetchall()
+    rows = c.execute(
+        "SELECT id,user_id,phone,interval_seconds,next_run FROM scheduled_tasks WHERE is_active=1"
+    ).fetchall()
     ok = 0; dead = 0
-    for tid, uid, phone, iv in rows:
-        sess_row = c.execute("SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid, phone)).fetchone()
+    for tid, uid, phone, iv, next_run in rows:
+        sess_row = c.execute(
+            "SELECT session_str FROM user_accounts WHERE user_id=? AND phone=?", (uid, phone)
+        ).fetchone()
         if not sess_row:
-            c.execute("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,)); conn.commit(); dead += 1; continue
+            c.execute("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,))
+            conn.commit(); dead += 1; continue
         cl = await open_client(phone, sess_row[0])
-        if cl:
-            await close(cl); start_task(tid, uid, phone, sess_row[0], iv); ok += 1
-        else:
-            c.execute("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,)); conn.commit()
-            try: await bot.send_message(uid, f"⚠️ Task #{tid} disabled — `{phone}` session expire. /addsession se dobara add karo.")
+        if not cl:
+            c.execute("UPDATE scheduled_tasks SET is_active=0 WHERE id=?", (tid,))
+            conn.commit()
+            try: await bot.send_message(uid, f"⚠️ Task #{tid} disabled — `{phone}` session expire.")
             except Exception: pass
-            dead += 1
-    print(f"Tasks: {ok} restored, {dead} disabled.")
+            dead += 1; continue
+        await close(cl)
+
+        # ── Calculate delay before first run ──
+        delay = 0
+        if next_run:
+            try:
+                nr_dt = parse_iso(next_run)
+                diff  = (nr_dt - now_utc()).total_seconds()
+                delay = max(0, diff)   # 0 if overdue, else wait remaining time
+            except Exception:
+                delay = iv  # fallback: wait full interval
+
+        # Spread out tasks — add small offset per task to avoid simultaneous sends
+        delay = delay + (ok * 3)  # 3 sec gap between each task restart
+
+        start_task(tid, uid, phone, sess_row[0], iv, initial_delay=delay)
+        ok += 1
+
+    print(f"Tasks: {ok} restored (spread out), {dead} disabled.")
 
 # ─────────────────────────── CLOUD BACKUP SYSTEM ────────────
 
