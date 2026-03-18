@@ -140,7 +140,7 @@ async def log_event(event_type, admin_id, admin_name, code="", details=""):
         (event_type, admin_id, admin_name, code, details)
     )
 
-def now_utc():    return datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+def now_utc():    return datetime.utcnow()
 def now_iso():    return now_utc().isoformat()
 def parse_iso(s): return datetime.fromisoformat(s)
 
