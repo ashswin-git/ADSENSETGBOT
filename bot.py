@@ -140,7 +140,7 @@ async def log_event(event_type, admin_id, admin_name, code="", details=""):
         (event_type, admin_id, admin_name, code, details)
     )
 
-def now_utc():    return datetime.utcnow()
+def now_utc():    return datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 def now_iso():    return now_utc().isoformat()
 def parse_iso(s): return datetime.fromisoformat(s)
 
@@ -467,7 +467,7 @@ async def cmd_start(event):
             "\n\n⏳ **Trial expire ho gaya.**\n\n"
             "🔑 Access ke liye:\n"
             "  /redeem CODE — Code lagao\n"
-            "  📩 Contact: @V4\\_XTRD"
+            "  📩 Contact: @V4_XTRD"
         )
         await send_welcome(event, caption, main_kb())
 
@@ -1101,7 +1101,7 @@ async def _show_userinfo(ctx, uid, requester_id=None):
         "🔐 " + status + "\n"
         "" + prot_icon + " Protection: " + ("ON" if is_prot2 else "OFF") + "\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📱 Accounts (" + str(len(phones)) + "/3):\n"
+        "📱 Accounts (" + str(len(phones)) + "):\n"
     )
     for ph, ad in phones:
         out += "  • `" + ph + "`\n"
@@ -1129,9 +1129,12 @@ async def _show_userinfo(ctx, uid, requester_id=None):
         [Button.inline("🗑 Delete",  ("udelc_" + str(uid)).encode())],
     ]
     try:
-        await ctx.edit(out, buttons=btns)
+        await ctx.edit(out, buttons=btns, parse_mode='md')
     except Exception:
-        await ctx.reply(out, buttons=btns)
+        try:
+            await ctx.reply(out, buttons=btns, parse_mode='md')
+        except Exception as e:
+            print(f"userinfo error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/ban\s+(\d+)$"))
 async def cmd_ban(event):
@@ -2685,7 +2688,7 @@ def _make_json_export():
         "users", "user_accounts", "access_codes",
         "code_requests", "scheduled_tasks", "admins", "logs"
     ]
-    export = {"backup_time": datetime.utcnow().isoformat(), "tables": {}}
+    export = {"backup_time": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).replace(tzinfo=None).isoformat(), "tables": {}}
     for table in tables:
         try:
             rows = c.execute(f"SELECT * FROM {table}").fetchall()
@@ -2702,7 +2705,7 @@ async def _do_full_backup(notify=False):
         if not os.path.exists(DB_FILE):
             return False, "DB file nahi mili!"
 
-        stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
+        stamp = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d_%H-%M")
 
         # ── Stats gather karo ──
         try:
@@ -2944,7 +2947,7 @@ async def cmd_restoredb(event):
         
         # Current DB ka local backup
         if os.path.exists(DB_FILE):
-            stamp_bk = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            stamp_bk = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S")
             bk_path  = DB_FILE + ".bak_" + stamp_bk
             import shutil
             shutil.copy2(DB_FILE, bk_path)
