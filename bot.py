@@ -257,8 +257,6 @@ async def send_welcome(event, caption, buttons):
 async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
-    cached_groups = None        # Cache dialogs — refresh every 30 min
-    last_dialog_fetch = 0
     while True:
         row = c.execute(
             "SELECT is_active,messages_json,current_msg_idx,fail_count "
@@ -277,14 +275,15 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
 
         if cl:
             try:
-                import time as _time
-                now_ts = _time.time()
-                if cached_groups is None or (now_ts - last_dialog_fetch) > 600:
-                    # Get ALL dialogs — no limit
-                    dialogs       = await cl.get_dialogs(limit=None)
-                    cached_groups = [d for d in dialogs if d.is_group or d.is_channel]
-                    last_dialog_fetch = now_ts
-                groups = cached_groups
+                # Fresh fetch — ALL groups/channels user is member of
+                all_dialogs = []
+                try:
+                    # Main folder
+                    async for d in cl.iter_dialogs():
+                        all_dialogs.append(d)
+                except Exception:
+                    all_dialogs = await cl.get_dialogs(limit=None)
+                groups = [d for d in all_dialogs if d.is_group or d.is_channel]
                 sent   = 0
 
                 # Get forward pairs + entities
