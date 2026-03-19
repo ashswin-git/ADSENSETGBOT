@@ -278,13 +278,21 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
                 # Fresh fetch — ALL groups/channels user is member of
                 all_dialogs = []
                 try:
-                    # Main folder
                     async for d in cl.iter_dialogs():
                         all_dialogs.append(d)
                 except Exception:
                     all_dialogs = await cl.get_dialogs(limit=None)
                 groups = [d for d in all_dialogs if d.is_group or d.is_channel]
                 sent   = 0
+                print(f"Task #{task_id} | {phone} | Found {len(all_dialogs)} dialogs | {len(groups)} groups/channels")
+                try:
+                    await bot.send_message(uid,
+                        f"📊 Task #{task_id} starting\n"
+                        f"📱 `{phone}`\n"
+                        f"👥 {len(groups)} groups/channels found\n"
+                        f"🔄 Sending..."
+                    )
+                except Exception: pass
 
                 # Get forward pairs + entities
                 task_row2 = c.execute(
@@ -376,9 +384,11 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
                     (next_idx, next_run, task_id)
                 )
                 label = f"msg {idx+1}/{len(msgs)}" if len(msgs) > 1 else "msg"
+                print(f"Task #{task_id} done | {sent}/{len(groups)} sent")
                 try:
                     await bot.send_message(uid,
-                        f"✅ Task #{task_id} ({label}) → **{sent}** groups\n"
+                        f"✅ Task #{task_id} ({label})\n"
+                        f"📤 Sent: **{sent}/{len(groups)}** groups\n"
                         f"📝 `{msg[:60]}{'...' if len(msg)>60 else ''}`")
                 except Exception: pass
             except Exception as e:
