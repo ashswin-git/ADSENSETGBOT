@@ -114,7 +114,9 @@ except Exception: pass
 conn.commit()
 
 # ─────────────────────────── GLOBALS ─────────────────────────
-bot              = TelegramClient("bot_session", API_ID, API_HASH)
+import os as _os
+_sess_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "bot_session")
+bot = TelegramClient(_sess_path, API_ID, API_HASH, connection_retries=5)
 pending: dict    = {}
 scheduler_tasks: dict = {}
 db_lock          = None
@@ -277,8 +279,9 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
             try:
                 import time as _time
                 now_ts = _time.time()
-                if cached_groups is None or (now_ts - last_dialog_fetch) > 1800:
-                    dialogs       = await cl.get_dialogs(limit=500)
+                if cached_groups is None or (now_ts - last_dialog_fetch) > 600:
+                    # Get ALL dialogs — no limit
+                    dialogs       = await cl.get_dialogs(limit=None)
                     cached_groups = [d for d in dialogs if d.is_group or d.is_channel]
                     last_dialog_fetch = now_ts
                 groups = cached_groups
@@ -288,12 +291,19 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
                 task_row2 = c.execute(
                     "SELECT msg_ids_json FROM scheduled_tasks WHERE id=?", (task_id,)
                 ).fetchone()
-                fwd_data  = {}
+                fwd_data   = {}
+                fwd_pairs2 = []
+                ents_all   = []
                 try:
-                    fwd_data = json.loads(task_row2[0] or "{}") if task_row2 else {}
+                    raw = json.loads(task_row2[0] or "{}") if task_row2 else {}
+                    if isinstance(raw, dict):
+                        # New format: {"pairs": [...], "ents": [...]}
+                        fwd_pairs2 = raw.get("pairs", [])
+                        ents_all   = raw.get("ents", [])
+                    elif isinstance(raw, list):
+                        # Old format: list of entities
+                        ents_all   = raw
                 except: pass
-                fwd_pairs2 = fwd_data.get("pairs", [])
-                ents_all   = fwd_data.get("ents", [])
                 ents_json2 = ents_all[idx % len(ents_all)] if ents_all else None
                 fwd_pair   = fwd_pairs2[idx % len(fwd_pairs2)] if fwd_pairs2 else None
                 orig_mid   = fwd_pair[0] if fwd_pair and len(fwd_pair) > 0 else None
@@ -341,26 +351,26 @@ async def run_task(task_id, uid, phone, sess, interval, initial_delay=0):
                 entities_to_use = rebuild_entities(ents_json2)
 
                 all_targets = [g.entity for g in groups]
+                sent = 0
 
                 for target in all_targets:
                     try:
                         if orig_mid and orig_peer2:
-                            # ✅ Forward from original source — exact format!
                             await cl.forward_messages(target, orig_mid, orig_peer2)
                         elif entities_to_use:
-                            # ✅ Send with entities — bold/quote preserved
                             await cl.send_message(target, msg, formatting_entities=entities_to_use)
                         else:
                             await cl.send_message(target, msg)
                         sent += 1
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(1)
                     except FloodWaitError as fw:
-                        await asyncio.sleep(fw.seconds + 5)
-                    except Exception:
+                        await asyncio.sleep(fw.seconds + 10)
                         try:
                             await cl.send_message(target, msg)
                             sent += 1
                         except Exception: pass
+                    except Exception: pass
+
                 await close(cl)
                 await db_write(
                     "UPDATE scheduled_tasks SET fail_count=0,current_msg_idx=?,next_run=? WHERE id=?",
@@ -2250,12 +2260,16 @@ async def cb_tedit_iv(event):
 async def _do_redeem(ctx, uid, code):
     row = c.execute("SELECT * FROM access_codes WHERE code=?", (code,)).fetchone()
     if not row: await ctx.reply("❌ Code exist nahi karta."); return
-    _, days, _, claimed_by, _, expires, active = row
+    code_val = row[0]
+    days     = row[1]
+    claimed_by = row[3]
+    expires  = row[5]
+    active   = row[6]
     if not active: await ctx.reply("❌ Code revoke ho chuka hai."); return
     if claimed_by and claimed_by != uid: await ctx.reply("❌ Code kisi aur ne le liya."); return
     if now_utc() > parse_iso(expires): await ctx.reply("⚠️ Code expire ho gaya."); return
     if not claimed_by:
-        await db_write("UPDATE access_codes SET claimed_by=?,claimed_at=? WHERE code=?", (uid, now_iso(), code))
+        await db_write("UPDATE access_codes SET claimed_by=?,claimed_at=? WHERE code=?", (uid, now_iso(), code_val))
         # Log claim
         _urow4 = c.execute("SELECT username FROM users WHERE user_id=?", (uid,)).fetchone()
         _un4   = _urow4[0] if _urow4 and _urow4[0] else ""
@@ -2534,7 +2548,7 @@ async def on_text(event):
                     [Button.inline(f"➕ Add #{len(msgs)+1}", b"add_msg")],
                     [Button.inline("▶️ Continue",           b"msgs_done")],
                     [Button.inline("❌ Cancel",             b"cx")],
-                ]
+                ], parse_mode='md'
             )
 
     elif act == "add_phone":
@@ -3055,6 +3069,14 @@ async def main():
     global db_lock
     db_lock = asyncio.Lock()
     print("Bot starting...")
+    # Remove stale session journal if exists
+    import glob as _glob
+    for _jf in _glob.glob(str(_sess_path) + "*.session-journal"):
+        try: 
+            import os as _o
+            _o.remove(_jf)
+            print(f"Removed stale journal: {_jf}")
+        except: pass
     await bot.start(bot_token=BOT_TOKEN)
     print("Connected!")
     await restore_tasks()
